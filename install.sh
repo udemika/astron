@@ -9,7 +9,7 @@ START=true
 UNINSTALL=false
 INSTALL_MODE=""
 CUSTOM_PORT="${ASTRA_PORT:-8000}"
-REPO_URL="${ASTRA_REPO_URL:-https://github.com/udemika/astrag.git}"
+REPO_URL="${ASTRA_REPO_URL:-https://github.com/udemika/astron.git}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -153,6 +153,7 @@ rm -rf "$APP_DIR/venv"
 # executable and falls back to the Python engine otherwise.
 install_astrag_core() {
     if [ "$(uname -m)" = "x86_64" ] && [ -f "$SCRIPT_DIR/astrag-core" ] && "$SCRIPT_DIR/astrag-core" --version >/dev/null 2>&1; then
+        rm -f "$APP_DIR/astrag-core"
         install -o root -g root -m 0755 "$SCRIPT_DIR/astrag-core" "$APP_DIR/astrag-core"
     elif [ -f "$SCRIPT_DIR/astrag_core.c" ]; then
         echo "==> Building astrag-core from source..."
