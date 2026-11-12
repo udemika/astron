@@ -1022,7 +1022,7 @@ static void oseg_unref(oseg_t *s)
 typedef struct front front_t;
 typedef struct hls hls_t;
 
-enum { IN_WAIT, IN_TS, IN_HLS };
+enum { IN_WAIT, IN_TS, IN_HLS, IN_IDLE };
 
 typedef struct channel {
     char id[128], name[160];
@@ -1081,6 +1081,9 @@ typedef struct channel {
     uint64_t win_bytes, packets, cc_err, pes_err, sync_losses;
     double win_start, bitrate;
     int scr_win, scrambled;
+    /* on-demand */
+    int keep_active, idle_reported;
+    double idle_delay, last_client_act;
 } channel_t;
 
 static channel_t *g_channels;
@@ -1348,6 +1351,8 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
 
 static void ring_resize(channel_t *ch, size_t ncap)
 {
+    if (!ch->ring || !ch->rcap)
+        return;
     ncap = ncap / TS * TS;
     if (ncap < TS * 64 || ncap == ch->rcap)
         return;
@@ -1369,12 +1374,16 @@ static void ring_resize(channel_t *ch, size_t ncap)
 
 static uint64_t ring_low(channel_t *ch)
 {
+    if (!ch->ring || ch->rcap <= 64 * TS)
+        return ch->wpos;
     uint64_t room = ch->rcap - 64 * TS;
     return ch->wpos > room ? ch->wpos - room : 0;
 }
 
 static void ring_copy(channel_t *ch, buf_t *dst, uint64_t from, uint64_t to)
 {
+    if (!ch->ring || !ch->rcap)
+        return;
     while (from < to) {
         size_t o = from % ch->rcap;
         size_t n = min_sz(ch->rcap - o, to - from);
@@ -1520,7 +1529,7 @@ static void hls_out_activate(channel_t *ch)
 
 static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
 {
-    if (!n)
+    if (!n || !ch->ring || !ch->rcap)
         return;
     ch->last_data = g_now;
     ch->win_bytes += n;
@@ -1725,10 +1734,12 @@ static void front_close(front_t *fr)
     if (fr->up)
         up_close(fr->up);
     if (fr->mode == FR_TS && fr->ch) {
+        fr->ch->last_client_act = g_now;
         ch_list_remove(&fr->ch->clients, fr);
         fr->ch->nclients--;
         ctl_send("SESS-\t%llu\n", fr->sess);
     } else if (fr->mode == FR_WAIT && fr->ch) {
+        fr->ch->last_client_act = g_now;
         ch_list_remove(&fr->ch->waiters, fr);
     }
     fr->ch = NULL;
@@ -2091,6 +2102,8 @@ static void pct_decode(char *s)
     *o = 0;
 }
 
+static void ch_wake(channel_t *ch);
+
 static void handle_directive(front_t *fr, char *dir)
 {
     char *f[8];
@@ -2111,10 +2124,13 @@ static void handle_directive(front_t *fr, char *dir)
         return;
     }
     if (!strcmp(f[0], "ts")) {
+        ch_wake(ch);
         start_ts_client(fr, ch, nf >= 3 ? f[2] : "");
         return;
     }
     if (!strcmp(f[0], "hls")) {
+        int was_idle = (ch->mode == IN_IDLE);
+        ch_wake(ch);
         snprintf(fr->hls_pre, sizeof fr->hls_pre, "%s", nf >= 3 ? f[2] : "");
         snprintf(fr->hls_suf, sizeof fr->hls_suf, "%s", nf >= 4 ? f[3] : "");
         fr->head_only = nf >= 5 && !strcmp(f[4], "HEAD");
@@ -2129,7 +2145,7 @@ static void handle_directive(front_t *fr, char *dir)
             up_close(fr->up);
         fr->mode = FR_WAIT;
         fr->ch = ch;
-        fr->wait_until = g_now + ch->seg_target + 2.5;
+        fr->wait_until = g_now + (was_idle || ch->wpos == 0 ? fmax(ch->seg_target * 3.0 + 6.0, 14.0) : ch->seg_target + 2.5);
         fr->cnext = ch->waiters;
         if (ch->waiters)
             ch->waiters->cprev = fr;
@@ -2138,6 +2154,7 @@ static void handle_directive(front_t *fr, char *dir)
         return;
     }
     if (!strcmp(f[0], "seg") && nf >= 3) {
+        ch_wake(ch);
         ch->hls_last_req = g_now;
         long long n = -1;
         if (!strncmp(f[2], "segment-", 8))
@@ -3403,6 +3420,58 @@ static void ch_del(channel_t *ch)
     bury(ch_free, ch);
 }
 
+static void ch_wake(channel_t *ch)
+{
+    ch->last_client_act = g_now;
+    if (ch->mode != IN_IDLE)
+        return;
+    if (!ch->ring) {
+        ch->rcap = TS * 22310;
+        ch->ring = malloc(ch->rcap);
+        if (!ch->ring)
+            return;
+    }
+    ch->wpos = 0;
+    memset(ch->out_cc, -1, sizeof ch->out_cc);
+    ts_reset_psi(ch);
+    ch->win_bytes = 0;
+    ch->win_start = g_now;
+    ch->bitrate = 0;
+    ch->pcr_bitrate = 0;
+    ch->next_resize = g_now + 5;
+    ch->hls_on = 1;
+    ch->cur_started = 0;
+    ch->cseg.len = 0;
+    ch->fails_row = 0;
+    ch->cur = 0;
+    ch->last_error[0] = 0;
+    ch->idle_reported = 0;
+    LOG("%s: waking up on demand", ch->id);
+    ch_input_start(ch);
+}
+
+static void ch_sleep(channel_t *ch)
+{
+    if (ch->mode == IN_IDLE)
+        return;
+    LOG("%s: going idle (no active viewers)", ch->id);
+    ch_input_stop(ch);
+    hls_out_off(ch);
+    free(ch->ring);
+    ch->ring = NULL;
+    ch->rcap = 0;
+    ch->wpos = 0;
+    ch->bitrate = 0;
+    ch->pcr_bitrate = 0;
+    ch->win_bytes = 0;
+    ch->scr_win = 0;
+    ch->scrambled = 0;
+    ts_reset_psi(ch);
+    ch->mode = IN_IDLE;
+    ch->idle_reported = 0;
+    snprintf(ch->last_error, sizeof ch->last_error, "idle");
+}
+
 static void ch_add(char **f, int nf)
 {
     /* ADD id seg_dur seg_keep name url... */
@@ -3425,25 +3494,73 @@ static void ch_add(char **f, int nf)
         free(ch);
         return;
     }
-    ch->rcap = TS * 22310; /* ~4 MB until the bitrate is known */
-    ch->ring = malloc(ch->rcap);
-    if (!ch->ring) {
-        ch_free(ch);
-        return;
+    ch->keep_active = 0;
+    ch->idle_delay = 20.0;
+    for (int i = 0; i < ch->nurls; i++) {
+        char *h = strchr(ch->urls[i], '#');
+        if (!h)
+            continue;
+        if (strstr(h + 1, "keep_active"))
+            ch->keep_active = 1;
+        char *id_opt = strstr(h + 1, "idle_delay=");
+        if (id_opt) {
+            double d = atof(id_opt + 11);
+            if (d >= 5.0 && d <= 3600.0)
+                ch->idle_delay = d;
+        }
     }
     memset(ch->out_cc, -1, sizeof ch->out_cc);
     ts_reset_psi(ch);
     ch->win_start = g_now;
     ch->next_resize = g_now + 5;
-    ch->hls_on = 1;
     ch->hls_last_req = -1e9;
-    ch->next = g_channels;
-    g_channels = ch;
-    ch_input_start(ch);
+    ch->last_client_act = -1e9;
+    if (ch->keep_active) {
+        ch->rcap = TS * 22310; /* ~4 MB until the bitrate is known */
+        ch->ring = malloc(ch->rcap);
+        if (!ch->ring) {
+            ch_free(ch);
+            return;
+        }
+        ch->hls_on = 1;
+        ch->next = g_channels;
+        g_channels = ch;
+        ch_input_start(ch);
+    } else {
+        ch->mode = IN_IDLE;
+        ch->hls_on = 0;
+        snprintf(ch->last_error, sizeof ch->last_error, "idle");
+        ch->next = g_channels;
+        g_channels = ch;
+    }
 }
 
 static void ch_tick(channel_t *ch, int second)
 {
+    if (ch->mode == IN_IDLE) {
+        if (second && !ch->idle_reported) {
+            ch->idle_reported = 1;
+            ctl_send("STAT\t%s\t0\t0\t%llu\t%llu\t0\t%d\t%llu\t-1\t0\t\t\t%llu\tidle\n",
+                     ch->id, (unsigned long long)ch->cc_err, (unsigned long long)ch->pes_err,
+                     ch->cur + 1, (unsigned long long)ch->packets, ch->input_errors);
+        }
+        return;
+    }
+    if (ch->nclients > 0 || ch->waiters != NULL) {
+        ch->last_client_act = g_now;
+    } else if (!ch->keep_active) {
+        double last_act = fmax(ch->last_client_act, ch->hls_last_req);
+        if (g_now - last_act >= ch->idle_delay) {
+            ch_sleep(ch);
+            if (second && !ch->idle_reported) {
+                ch->idle_reported = 1;
+                ctl_send("STAT\t%s\t0\t0\t%llu\t%llu\t0\t%d\t%llu\t-1\t0\t\t\t%llu\tidle\n",
+                         ch->id, (unsigned long long)ch->cc_err, (unsigned long long)ch->pes_err,
+                         ch->cur + 1, (unsigned long long)ch->packets, ch->input_errors);
+            }
+            return;
+        }
+    }
     if (ch->mode == IN_WAIT) {
         if (g_now >= ch->retry_at)
             ch_input_start(ch);
@@ -3576,7 +3693,11 @@ static void ctl_line(ctl_t *c, char *line)
     }
     if (!strcmp(f[0], "ADD"))
         ch_add(f, nf);
-    else if (!strcmp(f[0], "DEL") && nf >= 2) {
+    else if (!strcmp(f[0], "WAKE") && nf >= 2) {
+        channel_t *ch = ch_find(f[1]);
+        if (ch)
+            ch_wake(ch);
+    } else if (!strcmp(f[0], "DEL") && nf >= 2) {
         channel_t *ch = ch_find(f[1]);
         if (ch)
             ch_del(ch);
@@ -3635,6 +3756,8 @@ static void ctl_accept(void)
     c->ev.fd = fd;
     c->ev.obj = c;
     g_ctl = c;
+    for (channel_t *ch = g_channels; ch; ch = ch->next)
+        ch->idle_reported = 0;
     ev_watch(&c->ev, EPOLLIN);
 }
 
