@@ -1263,9 +1263,9 @@ static int pes_is_kf(const uint8_t *p, int off, int st)
                 return 0;
         } else {
             int t = b & 0x1F;
-            if (t == 5 || t == 7)
+            if (t == 7 || t == 5)
                 return 1;
-            if (t == 1)
+            if (t == 1 || t == 2 || t == 6)
                 return 0;
         }
         i += 2;
@@ -1342,7 +1342,7 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
                 ch->kind[pid] = kind = K_AUDIO;
         }
     }
-    if (kind == K_VIDEO && !scr && (afc & 1) && (rai || (pusi && pes_is_kf(p, off, ch->stype[pid]))))
+    if (kind == K_VIDEO && !scr && (afc & 1) && ((pusi && pes_is_kf(p, off, ch->stype[pid])) || (rai && pusi && !ch->stype[pid])))
         *is_kf = 1;
     return 1;
 }
@@ -1444,7 +1444,7 @@ static void seg_finish(channel_t *ch, double dur)
     ch->cseg.p = NULL;
     ch->cseg.len = ch->cseg.cap = 0;
     /* Segmenter always runs (like the Python engine) so a new HLS viewer gets a full window at once; idle channels keep 2. */
-    int keep = g_now - ch->hls_last_req > 60.0 ? 2 : ch->seg_keep;
+    int keep = g_now - ch->hls_last_req > 60.0 ? 3 : ch->seg_keep;
     while (ch->nsegs > 0 && (ch->nsegs == 16 || ch->nsegs >= keep)) {
         oseg_unref(ch->segs[0]);
         memmove(ch->segs, ch->segs + 1, (ch->nsegs - 1) * sizeof ch->segs[0]);
@@ -1475,7 +1475,8 @@ static void hls_out_feed(channel_t *ch, const uint8_t *s, size_t o, const size_t
             continue;
         }
         double d = seg_elapsed(ch, kfp[k]);
-        if (d >= ch->seg_target) {
+        double target = ch->mode == IN_TS ? (ch->nsegs < 2 ? 1.0 : fmin(1.5, ch->seg_target * 0.6)) : ch->seg_target * 0.72;
+        if (d >= target) {
             buf_add(&ch->cseg, s + run, kfo[k] - run);
             seg_finish(ch, d);
             run = kfo[k];
@@ -1682,6 +1683,8 @@ struct front {
     uint64_t pos;
     buf_t pre;
     size_t pre_off;
+    int wait_kf;
+    double kf_deadline;
     double last_progress;
     unsigned long long sess;
     char hls_pre[700], hls_suf[700];
@@ -1951,6 +1954,37 @@ static void client_send(front_t *c)
     channel_t *ch = c->ch;
     if (!ch || c->ev.dead)
         return;
+    if (c->wait_kf) {
+        psicap_t *pat = cap_for(ch, 0, 0);
+        int have_psi = pat && pat->ndone && ch->npmt > 0;
+        if (!(ch->kf_cnt > 0 && have_psi) && g_now < c->kf_deadline) {
+            size_t prelen = c->pre.len - c->pre_off;
+            if (prelen) {
+                ssize_t w = send(c->ev.fd, c->pre.p + c->pre_off, prelen, MSG_NOSIGNAL);
+                if (w < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        c->blocked = 1;
+                        ev_watch(&c->ev, EPOLLIN | EPOLLOUT);
+                        return;
+                    }
+                    front_close(c);
+                    return;
+                }
+                c->last_progress = g_now;
+                c->pre_off += (size_t)w;
+                if (c->pre_off >= c->pre.len) {
+                    c->pre.len = 0;
+                    c->pre_off = 0;
+                }
+            }
+            c->blocked = 0;
+            ev_watch(&c->ev, EPOLLIN);
+            return;
+        }
+        c->wait_kf = 0;
+        c->pos = pick_start(ch);
+        client_prefix(ch, &c->pre, c->pos);
+    }
     for (int it = 0; it < 8; it++) {
         uint64_t lo = ring_low(ch);
         if (c->pos < lo) {
@@ -2023,8 +2057,16 @@ static void start_ts_client(front_t *fr, channel_t *ch, const char *login)
     buf_str(&fr->pre, "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store, no-cache, "
                       "must-revalidate\r\nPragma: no-cache\r\nAccept-Ranges: none\r\nAccess-Control-Allow-Origin: "
                       "*\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n");
-    fr->pos = pick_start(ch);
-    client_prefix(ch, &fr->pre, fr->pos);
+    psicap_t *pat = cap_for(ch, 0, 0);
+    if (ch->kf_cnt > 0 && pat && pat->ndone && ch->npmt > 0) {
+        fr->wait_kf = 0;
+        fr->pos = pick_start(ch);
+        client_prefix(ch, &fr->pre, fr->pos);
+    } else {
+        fr->wait_kf = 1;
+        fr->kf_deadline = g_now + 3.5;
+        fr->pos = 0;
+    }
     fr->cnext = ch->clients;
     if (ch->clients)
         ch->clients->cprev = fr;
@@ -2041,12 +2083,17 @@ static void start_ts_client(front_t *fr, channel_t *ch, const char *login)
 static void send_playlist(front_t *fr, channel_t *ch)
 {
     buf_t b = {0};
-    double maxd = ch->seg_target;
+    double maxd = 1.0, start_off = 0.0;
     for (int i = 0; i < ch->nsegs; i++)
         if (ch->segs[i]->dur > maxd)
             maxd = ch->segs[i]->dur;
+    int first_play = ch->nsegs > 3 ? ch->nsegs - 3 : 0;
+    for (int i = first_play; i < ch->nsegs; i++)
+        start_off += ch->segs[i]->dur;
     buf_fmt(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%lld\n",
             (int)ceil(maxd), ch->nsegs ? ch->segs[0]->seq : 0LL);
+    if (ch->nsegs >= 2 && start_off > 0.5)
+        buf_fmt(&b, "#EXT-X-START:TIME-OFFSET=-%.3f\n", start_off);
     for (int i = 0; i < ch->nsegs; i++) {
         oseg_t *s = ch->segs[i];
         if (s->disc && i > 0)
@@ -2137,7 +2184,7 @@ static void handle_directive(front_t *fr, char *dir)
         ch->hls_last_req = g_now;
         if (!ch->hls_on)
             hls_out_activate(ch);
-        if (ch->nsegs) {
+        if (ch->nsegs >= 3) {
             send_playlist(fr, ch);
             return;
         }
@@ -2145,7 +2192,7 @@ static void handle_directive(front_t *fr, char *dir)
             up_close(fr->up);
         fr->mode = FR_WAIT;
         fr->ch = ch;
-        fr->wait_until = g_now + (was_idle || ch->wpos == 0 ? fmax(ch->seg_target * 3.0 + 6.0, 14.0) : ch->seg_target + 2.5);
+        fr->wait_until = g_now + (was_idle || ch->wpos == 0 ? fmax(ch->seg_target * 3.0 + 6.0, 14.0) : ch->seg_target * 2.0 + 3.0);
         fr->cnext = ch->waiters;
         if (ch->waiters)
             ch->waiters->cprev = fr;
@@ -3040,6 +3087,10 @@ static void hls_parse(hls_t *h, char *text, const char *base)
         url_resolve(base, best_uri, u, sizeof u);
         snprintf(h->pl, sizeof h->pl, "%s", u);
         h->next_poll = g_now;
+        if (!h->plf) {
+            h->plbody.len = 0;
+            h->plf = fetch_start(h->pl, h->ch->ua, &g_pl_cb, h, 8.0, 10.0);
+        }
         return;
     }
     ent_t ring[16];
@@ -3113,7 +3164,7 @@ static void hls_parse(hls_t *h, char *text, const char *base)
             isnew[i] = 0;
         nnew += isnew[i];
     }
-    int limit = h->first ? (h->td <= 6.0 ? 3 : 2) : (h->td <= 6.0 ? 3 : 2);
+    int limit = h->first ? (h->td <= 5.0 ? 4 : 3) : (h->td <= 6.0 ? 3 : 2);
     int skip = nnew > limit ? nnew - limit : 0;
     h->first = 0;
     int added = 0;
@@ -3187,15 +3238,25 @@ static void hls_pace(hls_t *h)
     double bps = hls_rate(h);
     size_t total = hls_total(h);
     double buf_sec = total / bps;
-    double hi = fmax(6.5, h->td + 1.5), mid = fmax(4.2, h->td * 0.75 + 0.5);
-    double factor = buf_sec > hi ? 1.04 : buf_sec > mid ? 1.015 : buf_sec >= 1.0 ? 1.0 : 0.992;
-    if (!h->burst_done && total >= TS * 64) {
-        h->credit += fmin(bps * 1.0, 3.0 * 1024 * 1024);
-        h->burst_done = 1;
+    double hi = fmax(5.5, h->td + 1.0), mid = fmax(3.0, h->td * 0.65);
+    double factor = buf_sec > hi ? 1.06 : buf_sec > mid ? 1.025 : 1.005;
+    if (!h->burst_done) {
+        if (ch->nsegs < 3) {
+            h->credit = (double)total + 65536.0;
+        } else {
+            h->burst_done = 1;
+            h->credit = fmin(bps * 0.5, 1.5 * 1024 * 1024);
+        }
+    } else {
+        h->credit += dt * bps * factor;
     }
-    h->credit += dt * bps * factor;
     double cap = fmax(bps * 0.3, 65536.0);
     while (h->sh) {
+        if (!h->burst_done && ch->nsegs >= 3) {
+            h->burst_done = 1;
+            h->credit = fmin(bps * 0.4, 1.0 * 1024 * 1024);
+            break;
+        }
         slot_t *s = h->sh;
         chunk_t *c = s->ch_head;
         if (!c) {
@@ -3589,7 +3650,7 @@ static void ch_tick(channel_t *ch, int second)
     }
     for (front_t *w = ch->waiters, *nx; w; w = nx) {
         nx = w->cnext;
-        if (ch->nsegs) {
+        if (ch->nsegs >= 3 || (ch->nsegs >= 1 && g_now > w->wait_until - 1.5)) {
             wait_remove(w);
             send_playlist(w, ch);
         } else if (g_now > w->wait_until) {

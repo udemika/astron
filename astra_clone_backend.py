@@ -1312,24 +1312,28 @@ def _build_cluster_stream_inputs(srv: dict, remote_cfg: dict, rs: dict) -> list:
     orig_id = str(rs.get("id") or "").strip()
     if not rhost or not orig_id:
         return []
+    if str(rs.get("type") or "spts").lower() == "mpts" and not rs.get("output"):
+        return []
+    raw_inputs = [u for u in (rs.get("input") or []) if isinstance(u, str) and u.strip()]
+    if raw_inputs and all(u.strip().lower().startswith("exec://") for u in raw_inputs):
+        return []
+
     rsettings = remote_cfg.get("settings") if isinstance(remote_cfg.get("settings"), dict) else {}
     rauth = remote_cfg.get("auth") if isinstance(remote_cfg.get("auth"), dict) else {}
     rusers = remote_cfg.get("users") if isinstance(remote_cfg.get("users"), dict) else {}
 
-    play_token = ""
+    play_port = rsettings.get("http_play_port") or rport
+    play_url = f"http://{rhost}:{play_port}/play/{orig_id}"
     if rauth.get("enable"):
         if ruser and isinstance(rusers.get(ruser), dict) and rusers[ruser].get("token"):
-            play_token = str(rusers[ruser]["token"])
+            play_url += f"?token={rusers[ruser]['token']}"
+        elif ruser and rpass:
+            play_url += f"?auth={ruser}:{rpass}"
         else:
             for uinfo in rusers.values():
                 if isinstance(uinfo, dict) and uinfo.get("enable", True) is not False and uinfo.get("token"):
-                    play_token = str(uinfo["token"])
+                    play_url += f"?token={uinfo['token']}"
                     break
-
-    play_port = rsettings.get("http_play_port") or rport
-    play_url = f"http://{rhost}:{play_port}/play/{orig_id}"
-    if play_token:
-        play_url += f"?token={play_token}"
 
     out_urls = []
     for u in rs.get("output") or []:
@@ -1407,6 +1411,9 @@ async def _sync_cluster_servers():
         if not isinstance(remote_cfg, dict):
             continue
 
+        rsettings = remote_cfg.get("settings") if isinstance(remote_cfg.get("settings"), dict) else {}
+        has_http_play = bool(rsettings.get("http_play_stream") or rsettings.get("http_play_hls"))
+
         for rs in remote_cfg.get("make_stream") or []:
             if not isinstance(rs, dict):
                 continue
@@ -1420,7 +1427,7 @@ async def _sync_cluster_servers():
             if not proxy_inputs:
                 continue
             prefixed_id = f"c{idx + 1}_{orig_id}"
-            if orig_id not in local_ids and orig_id not in new_cluster_streams:
+            if has_http_play and orig_id not in local_ids and orig_id not in new_cluster_streams:
                 eff_id = orig_id
             else:
                 eff_id = prefixed_id
@@ -1448,7 +1455,7 @@ async def _sync_cluster_servers():
             new_aliases[(srv_name, orig_id)] = eff_id
             new_aliases[(str(idx + 1), orig_id)] = eff_id
             new_aliases[prefixed_id] = eff_id
-            if orig_id not in new_aliases:
+            if has_http_play and orig_id not in new_aliases:
                 new_aliases[orig_id] = eff_id
 
     old_cluster_ids = set(state.cluster_streams.keys())
