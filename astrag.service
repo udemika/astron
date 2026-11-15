@@ -7,22 +7,15 @@ Wants=network-online.target
 Type=simple
 User=astrag
 Group=astrag
-WorkingDirectory=/opt/astrag
-Environment="PYTHONUNBUFFERED=1"
-Environment="PYTHONDONTWRITEBYTECODE=1"
-Environment="MALLOC_MMAP_THRESHOLD_=131072"
+WorkingDirectory=/var/lib/astrag
+Environment="MALLOC_MMAP_THRESHOLD_=1048576"
 Environment="MALLOC_TRIM_THRESHOLD_=131072"
 Environment="MALLOC_ARENA_MAX=2"
-Environment="ASTRA_STATIC_DIR=/opt/astrag/www"
-Environment="ASTRA_STATE_FILE=/etc/astrag/astrag.conf"
 Environment="ASTRA_CONFIG_FILE=/etc/astrag/astrag.conf"
-Environment="TMPDIR=/run/astrag"
-ExecStart=/usr/bin/python3 /opt/astrag/astra_clone_backend.py -c /etc/astrag/astrag.conf
+ExecStart=/usr/bin/astrag -c /etc/astrag/astrag.conf
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5
-RuntimeDirectory=astrag
-RuntimeDirectoryMode=0750
+Restart=always
+RestartSec=3
 StateDirectory=astrag
 StateDirectoryMode=0750
 ConfigurationDirectory=astrag
@@ -36,7 +29,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/etc/astrag /var/lib/astrag /run/astrag
+ReadWritePaths=/etc/astrag /var/lib/astrag
 LimitNOFILE=65536
 
 [Install]

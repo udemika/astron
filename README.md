@@ -1,29 +1,24 @@
-# AstraG — Сервер цифрового ТВ и IPTV-вещания (в стиле Cesbo Astra)
+# AstraG (Astasy — на базе `astron`) — Нативный однофайловый C-сервер цифрового ТВ и IPTV
 
-Автономный сервер приёма, буферизации и раздачи цифровых телевизионных потоков (**MPEG-TS / HLS / HTTP / HTTPS / UDP / RTP**) с веб-панелью управления, полностью повторяющий логику установки и управления классического бинарника **Cesbo Astra** (`astrag init`, `astrag remove`, `systemctl start astrag`).
+Автономный однофайловый сервер приёма, буферизации и раздачи цифровых телевизионных потоков (**MPEG-TS / HLS / HTTP / HTTPS / UDP / RTP**) с встроенной веб-панелью управления на базе логики репозитория **`udemika/astron`**, переписанный полностью на чистом **C** (исходники в `c_src/`).
 
-Приём и раздачу HTTP/HTTPS/HLS-каналов выполняет нативное C-ядро **`astrag-core`** (исходник: `astrag_core.c`, в `htop` и списке процессов отображается как **`astrag`**); веб-интерфейс, API и конфигурация работают на Python. Ядро уже встроено внутрь файла `astrag`.
-
----
-
-## Скриншоты интерфейса
-
-### Окно входа в веб-панель AstraG
-![Вход в AstraG](docs/screenshots/astrag-login.png)
-
-### Основное окно управления потоками (Dashboard)
-![Основное окно AstraG](docs/screenshots/astrag-main.png)
+### Ключевые особенности сборки `astasy` (из `astron`)
+- **Один полностью статический ELF-бинарник `astrag` (~4.6 МБ, `musl + OpenSSL + zlib` внутри)** — никаких зависимостей Python, `fastapi`, `uvicorn`, `pip`, `libssl.so.3`, `glibc` и распаковки в `/opt/astrag`. Работает «из коробки» на любом Linux `x86_64` (Ubuntu 18.04 / 20.04 / 22.04 / 24.04 LTS, Debian 10 / 11 / 12+, CentOS / AlmaLinux / Rocky, Alpine).
+- **Двойная HLS-буферизация из `astron` (`cseg` + `oseg_t->data`)** — каждый HLS-сегмент собирается в собственный независимый буфер с префиксом PAT/PMT, поэтому медленные HLS-клиенты не теряют сегменты при перезаписи кольцевого буфера канала (`ch->ring`), а сам `ch->ring` держит компактное окно (`max(8s, GOP + 3.5s)`).
+- **Встроенный веб-интерфейс** — сжатые gzip-ресурсы (`index.html`, `mod.js`, `account.html`, `favicon.png`) вшиты внутрь бинарника (`c_src/www_embed.h`).
+- **Режим «По запросу» (`IN_IDLE`)** — каналы без зрителей и активного `output` находятся в статусе `Inactive` (0% CPU, 0 МБ буфера), мгновенно включаются при открытии `/play/<id>` и засыпают через 20 сек после ухода последнего зрителя.
+- **Сквозной прокси кластера** — синхронизация каналов с удалённых узлов (`Settings → Servers`) и проксирование потоков/управления.
 
 ---
 
-## Установка на сервер (Ubuntu 22.04 / 24.04 LTS)
+## Установка на сервер (любой Linux `x86_64`: Ubuntu 18.04–24.04, Debian 10–12+, CentOS)
 
-### Вариант 1: Установка одним файлом `astrag` (рекомендуется, как в оригинальной Cesbo Astra)
+### Вариант 1: Установка одним бинарником `astrag` (рекомендуется, как в Cesbo Astra)
 
-Скачайте готовый исполняемый файл `astrag` из репозитория `udemika/astron` в `/usr/bin/astrag`, сделайте его исполняемым и зарегистрируйте системный сервис:
+Скачайте готовый нативный ELF-бинарник `astrag` из репозитория `udemika/astasy` в `/usr/bin/astrag`, сделайте его исполняемым и зарегистрируйте системный сервис:
 
 ```bash
-sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astron/main/astrag
+sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astasy/main/astrag
 sudo chmod +x /usr/bin/astrag
 sudo astrag init 8000
 sudo systemctl start astrag
@@ -33,40 +28,37 @@ sudo systemctl enable astrag
 #### То же самое одной командой (быстрая установка и автозапуск):
 
 ```bash
-sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astron/main/astrag && sudo chmod +x /usr/bin/astrag && sudo astrag init 8000 --start
+sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astasy/main/astrag && sudo chmod +x /usr/bin/astrag && sudo astrag init 8000 --start
 ```
 
-> При выполнении `astrag init` автоматически проверяются и доустанавливаются только штатные системные пакеты Ubuntu (`apt` без `pip` и без `venv`), распаковывается встроенное ядро в `/opt/astrag`, создается конфигурация `/etc/astrag/astrag.conf` и запускается служба `systemd` (в `htop` процесс отображается как **`astrag`**).
+> В `htop` работает один нативный процесс **`astrag`**. Никакие пакеты `python3-*` и `/opt/astrag` не устанавливаются. Все настройки и каналы в `/etc/astrag/astrag.conf` полностью совместимы и сохраняются при обновлении.
 
 ---
 
-### Вариант 2: Сборка в нативный ELF-бинарник (опционально)
-
-Если вы хотите дополнительно скомпилировать управляющий сервер на сервере в монолитный ELF-бинарник `/opt/astrag/astrag-bin`:
+### Вариант 2: Быстрая установка через `install.sh`
 
 ```bash
-sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astron/main/astrag
-sudo chmod +x /usr/bin/astrag
-sudo astrag init 8000 --binary --start
+curl -fsSL https://raw.githubusercontent.com/udemika/astasy/main/install.sh | sudo bash -s -- --start --port 8000
 ```
 
 ---
 
-### Вариант 3: Установка через скрипт `install.sh`
+### Вариант 3: Сборка из исходников C (`c_src/`)
 
 ```bash
-# Установка на системных APT-пакетах Ubuntu (без pip и без venv):
-curl -fsSL https://raw.githubusercontent.com/udemika/astron/main/install.sh | sudo bash -s -- --apt --start --port 8000
-
-# Или сборка в нативный бинарник:
-curl -fsSL https://raw.githubusercontent.com/udemika/astron/main/install.sh | sudo bash -s -- --binary --start --port 8000
+sudo apt-get update && sudo apt-get install -y gcc make libssl-dev zlib1g-dev
+git clone --depth 1 https://github.com/udemika/astasy.git
+cd astasy/c_src
+make
+sudo install -m 0755 astrag /usr/bin/astrag
+sudo astrag init 8000 --start
 ```
 
 ---
 
 ## Вход в веб-интерфейс
 
-После запуска откройте в браузере:
+Откройте в браузере:
 
 ```text
 http://<IP_ВАШЕГО_СЕРВЕРА>:8000/
@@ -76,112 +68,29 @@ http://<IP_ВАШЕГО_СЕРВЕРА>:8000/
 - **Логин**: `admin`
 - **Пароль**: `admin`
 
-*(Пароль можно сразу изменить в верхнем меню **Settings → Users** или **Account**).*
-
 ---
 
-## Управление сервисом (в стиле Cesbo Astra)
-
-Управление службой осуществляется стандартными командами `systemd`:
+## Управление сервисом и конфигурацией
 
 ```bash
-# Запуск сервера
+# Управление systemd
 sudo systemctl start astrag
-
-# Остановка сервера
 sudo systemctl stop astrag
-
-# Перезапуск сервера
 sudo systemctl restart astrag
-
-# Включение автозапуска при загрузке ОС
-sudo systemctl enable astrag
-
-# Отключение автозапуска
-sudo systemctl disable astrag
-
-# Просмотр статуса и логов
 sudo systemctl status astrag
 sudo journalctl -u astrag -f
-```
 
-### Конфигурационный файл `/etc/astrag/astrag.conf`
-
-Как и в оригинальной Cesbo Astra, **все настройки сервера** (порт `port`, пользователи и пароли `users`, список телеканалов `make_stream`, категории `categories`, кластерные серверы `servers`) хранятся в едином JSON-файле `/etc/astrag/astrag.conf`:
-
-```json
-{
-  "port": 8000,
-  "host": "0.0.0.0",
-  "gid": 466560,
-  "auth": {
-    "enable": true
-  },
-  "users": {
-    "admin": {
-      "type": 1,
-      "role": "admin",
-      "enable": true,
-      "password": "admin",
-      "created": 1793775989
-    }
-  },
-  "make_stream": []
-}
-```
-
-Вы можете редактировать порт, пароли и добавлять каналы прямо в `/etc/astrag/astrag.conf` (после правок выполните `sudo systemctl restart astrag`).
-
-### Запуск нового независимого экземпляра AstraG на другом порту (например, `8001`)
-
-Если указать другой порт (например `8001`), автоматически создается **новый независимый экземпляр** со своим файлом `/etc/astrag/astrag8001.conf` и отдельной службой `astrag8001`:
-
-```bash
-# Создание и запуск нового экземпляра на порту 8001 (/etc/astrag/astrag8001.conf):
+# Второй независимый экземпляр на другом порту (например, 8001):
 sudo astrag init 8001 --start
-
-# Управление вторым экземпляром:
-sudo systemctl status astrag8001
-sudo systemctl restart astrag8001
-
-# Удаление только экземпляра 8001:
 sudo astrag remove 8001 --purge
-```
 
-### Сброс пароля администратора через консоль
-
-```bash
+# Сброс пароля администратора через консоль:
 sudo astrag reset-password admin НовыйПароль123
 sudo systemctl restart astrag
-```
 
----
+# Обновление бинарника:
+sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astasy/main/astrag && sudo chmod +x /usr/bin/astrag && sudo astrag init 8000 --start && sudo systemctl restart astrag
 
-## Обновление AstraG
-
-Для обновления достаточно скачать свежий файл `/usr/bin/astrag` из `udemika/astron` и выполнить `astrag init` (все ваши потоки и настройки в `/etc/astrag/astrag.conf` полностью сохраняются):
-
-```bash
-sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astron/main/astrag && sudo chmod +x /usr/bin/astrag && sudo astrag init 8000 --start && sudo systemctl restart astrag
-```
-
----
-
-## Удаление AstraG
-
-### Стандартное удаление (как в Cesbo Astra)
-
-Остановка сервиса, удаление из автозагрузки и удаление исполняемого файла:
-
-```bash
-sudo systemctl stop astrag
-sudo systemctl disable astrag
-sudo astrag remove
-sudo rm -f /usr/bin/astrag
-```
-
-### Полное удаление одной командой (включая все настройки и базы `/etc/astrag`, `/var/lib/astrag`, `/opt/astrag`)
-
-```bash
+# Полное удаление:
 sudo astrag remove --purge
 ```

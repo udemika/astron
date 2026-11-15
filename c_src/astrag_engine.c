@@ -1,30 +1,16 @@
-/*
- * astrag-core: native data plane for AstraG.
- *
- * Owns the public HTTP ports. Every request is relayed to the Python control
- * server (uvicorn on 127.0.0.1); when Python answers a media route with an
- * "X-Astrag-Core" directive, the response is served here from shared per-channel
- * buffers instead (HTTP MPEG-TS, HLS playlists and segments).
- *
- * Inputs: HTTP/HTTPS MPEG-TS and HLS (master/media playlists, AES-128), ordered
- * failover between inputs. HLS input is downloaded ahead (two connections) and
- * released at the stream bitrate like Cesbo Astra's sync buffer.
- *
- * Control: Python connects to an abstract unix socket and sends tab separated
- * commands (AUTH, ADD, DEL, KILL, LISTEN, UNLISTEN); the core reports STAT and
- * SESS+/SESS- lines.
- */
 #define _GNU_SOURCE
 #include <features.h>
-/* Keep classic strtol/sscanf symbols: glibc 2.38 headers otherwise bind __isoc23_* and the binary
- * would not start on Ubuntu 22.04 (glibc 2.35). */
 #undef __GLIBC_USE_C2X_STRTOL
 #define __GLIBC_USE_C2X_STRTOL 0
+
+#include "astrag.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __GLIBC__
 #include <malloc.h>
+#endif
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -46,25 +32,22 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
-#define TS 188
-#define KF_N 48
-#define PCR_HZ 27000000.0
-#define PCR_WRAP (8589934592LL * 300LL)
-#define MAX_URLS 16
+double g_now = 0.0;
+int g_ep = -1;
+channel_t *g_channels = NULL;
+front_t *g_fronts = NULL;
+volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_hup = 0;
 
-static double g_now;
-static int g_ep = -1;
-static char g_secret[128];
-static int g_upstream_port;
-static int g_hls_parallel = 2; /* segments downloaded at once; 1 = sequential (variant 1) */
-static SSL_CTX *g_ssl;
-static unsigned long long g_sess_seq;
+static int g_hls_parallel = 2;
+static SSL_CTX *g_ssl = NULL;
+static unsigned long long g_sess_seq = 0;
+static buf_t g_scr = {0};
 
-#define LOG(...) do { fprintf(stderr, "[astrag-core] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define ELOG(...) do { fprintf(stderr, "[astrag] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
 static double now_s(void)
 {
@@ -78,9 +61,7 @@ static double clampd(double v, double lo, double hi) { return v < lo ? lo : (v >
 
 /* ------------------------------------------------------------------ buffers */
 
-typedef struct { uint8_t *p; size_t len, cap; } buf_t;
-
-static int buf_reserve(buf_t *b, size_t n)
+int buf_reserve(buf_t *b, size_t n)
 {
     if (b->len + n <= b->cap)
         return 0;
@@ -95,7 +76,7 @@ static int buf_reserve(buf_t *b, size_t n)
     return 0;
 }
 
-static int buf_add(buf_t *b, const void *d, size_t n)
+int buf_add(buf_t *b, const void *d, size_t n)
 {
     if (!n)
         return 0;
@@ -106,9 +87,12 @@ static int buf_add(buf_t *b, const void *d, size_t n)
     return 0;
 }
 
-static int buf_str(buf_t *b, const char *s) { return buf_add(b, s, strlen(s)); }
+int buf_str(buf_t *b, const char *s)
+{
+    return s ? buf_add(b, s, strlen(s)) : 0;
+}
 
-static int buf_fmt(buf_t *b, const char *fmt, ...)
+int buf_fmt(buf_t *b, const char *fmt, ...)
 {
     va_list ap;
     char tmp[1024];
@@ -118,17 +102,17 @@ static int buf_fmt(buf_t *b, const char *fmt, ...)
     if (n < 0)
         return -1;
     if ((size_t)n < sizeof tmp)
-        return buf_add(b, tmp, n);
-    if (buf_reserve(b, n + 1))
+        return buf_add(b, tmp, (size_t)n);
+    if (buf_reserve(b, (size_t)n + 1))
         return -1;
     va_start(ap, fmt);
-    vsnprintf((char *)b->p + b->len, n + 1, fmt, ap);
+    vsnprintf((char *)b->p + b->len, (size_t)n + 1, fmt, ap);
     va_end(ap);
-    b->len += n;
+    b->len += (size_t)n;
     return 0;
 }
 
-static void buf_drop(buf_t *b, size_t n)
+void buf_drop(buf_t *b, size_t n)
 {
     if (n >= b->len) {
         b->len = 0;
@@ -138,7 +122,7 @@ static void buf_drop(buf_t *b, size_t n)
     b->len -= n;
 }
 
-static void buf_free(buf_t *b)
+void buf_free(buf_t *b)
 {
     free(b->p);
     b->p = NULL;
@@ -147,15 +131,7 @@ static void buf_free(buf_t *b)
 
 /* --------------------------------------------------------------- event core */
 
-enum { EV_LISTEN = 1, EV_FRONT, EV_UP, EV_FETCH, EV_CTL_LISTEN, EV_CTL, EV_DNS };
-
-typedef struct ev {
-    int type, fd, reg, dead;
-    uint32_t mask;
-    void *obj;
-} ev_t;
-
-static void ev_watch(ev_t *e, uint32_t mask)
+void ev_watch(ev_t *e, uint32_t mask)
 {
     if (e->fd < 0 || e->dead)
         return;
@@ -171,7 +147,7 @@ static void ev_watch(ev_t *e, uint32_t mask)
     }
 }
 
-static void ev_close(ev_t *e)
+void ev_close(ev_t *e)
 {
     if (e->fd >= 0) {
         if (e->reg)
@@ -182,11 +158,14 @@ static void ev_close(ev_t *e)
     e->reg = 0;
 }
 
-typedef struct grave { void (*fn)(void *); void *p; struct grave *next; } grave_t;
-static grave_t *g_grave;
+typedef struct grave {
+    void (*fn)(void *);
+    void *p;
+    struct grave *next;
+} grave_t;
+static grave_t *g_grave = NULL;
 
-/* Objects are freed only after the current epoll batch so stale events stay safe. */
-static void bury(void (*fn)(void *), void *p)
+void bury(void (*fn)(void *), void *p)
 {
     grave_t *g = malloc(sizeof *g);
     if (!g) {
@@ -209,27 +188,36 @@ static void reap(void)
     }
 }
 
-static void set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); }
+static void set_nonblock(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl >= 0)
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
 
 /* --------------------------------------------------------------------- DNS */
 
 typedef void (*dns_cb)(void *arg, int ok, struct in_addr a);
-typedef struct dnsq {
+struct dnsq {
     char host[256];
     struct in_addr addr;
     int ok, cancelled;
     dns_cb cb;
     void *arg;
     struct dnsq *next;
-} dnsq_t;
+};
 
 static pthread_mutex_t g_dmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dcv = PTHREAD_COND_INITIALIZER;
-static dnsq_t *g_dqh, *g_dqt;
-static int g_dpipe[2];
+static dnsq_t *g_dqh = NULL, *g_dqt = NULL;
+static int g_dpipe[2] = {-1, -1};
 static ev_t g_dev;
-static struct { char host[256]; struct in_addr a; double exp; } g_dcache[256];
-static int g_dci;
+static struct {
+    char host[256];
+    struct in_addr a;
+    double exp;
+} g_dcache[256];
+static int g_dci = 0;
 
 static void *dns_thread(void *u)
 {
@@ -260,17 +248,21 @@ static void *dns_thread(void *u)
     return NULL;
 }
 
-/* Returns 1 with *out filled when resolved immediately, 0 when queued (*pend set). */
 static int dns_lookup(const char *host, dns_cb cb, void *arg, struct in_addr *out, dnsq_t **pend)
 {
     *pend = NULL;
+    if (!strcasecmp(host, "localhost")) {
+        out->s_addr = htonl(INADDR_LOOPBACK);
+        return 1;
+    }
     if (inet_pton(AF_INET, host, out) == 1)
         return 1;
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < 256; i++) {
         if (g_dcache[i].exp > g_now && !strcmp(g_dcache[i].host, host)) {
             *out = g_dcache[i].a;
             return 1;
         }
+    }
     dnsq_t *q = calloc(1, sizeof *q);
     if (!q)
         return -1;
@@ -333,17 +325,17 @@ static int url_parse(const char *url, int *https, char *host, size_t hl, int *po
         return -1;
     const char *end = p + strcspn(p, "/?#");
     auth[0] = 0;
-    const char *at = memrchr(p, '@', end - p);
+    const char *at = memrchr(p, '@', (size_t)(end - p));
     if (at) {
-        if (b64(p, at - p, auth, al))
+        if (b64(p, (size_t)(at - p), auth, al))
             return -1;
         p = at + 1;
     }
-    const char *colon = memchr(p, ':', end - p);
+    const char *colon = memchr(p, ':', (size_t)(end - p));
     const char *he = colon ? colon : end;
     if (he == p || (size_t)(he - p) >= hl)
         return -1;
-    memcpy(host, p, he - p);
+    memcpy(host, p, (size_t)(he - p));
     host[he - p] = 0;
     *port = *https ? 443 : 80;
     if (colon) {
@@ -370,7 +362,6 @@ static int url_parse(const char *url, int *https, char *host, size_t hl, int *po
     return 0;
 }
 
-/* Remove "." and ".." path segments in place (query string untouched). */
 static void url_normalize(char *u)
 {
     char *s = strstr(u, "://");
@@ -408,7 +399,7 @@ static void url_normalize(char *u)
         seg = sl + 1;
     }
     out[o] = 0;
-    size_t room = 4096 - (path - u);
+    size_t room = 4096 - (size_t)(path - u);
     snprintf(path, room, "%s%s", out, tail);
 }
 
@@ -450,44 +441,15 @@ static void url_resolve(const char *base, const char *ref, char *out, size_t out
 
 /* -------------------------------------------------------------- HTTP client */
 
-typedef struct fetch fetch_t;
-typedef struct fetch_cb {
-    void (*head)(fetch_t *);
-    void (*data)(fetch_t *, const uint8_t *, size_t);
-    void (*done)(fetch_t *, int ok, const char *err);
-} fetch_cb_t;
-
-enum { F_DNS, F_CONN, F_TLS, F_SEND, F_HEAD, F_BODY };
-
-struct fetch {
-    ev_t ev;
-    SSL *ssl;
-    int st;
-    char url[4096], host[256], target[4096], auth[512], ua[256];
-    int port, https, redirects;
-    double deadline, conn_to, idle_to;
-    buf_t req;
-    size_t req_off;
-    buf_t head;
-    int status, chunked, cst, cll;
-    int64_t clen, remain;
-    char cl[32];
-    char ctype[128];
-    dnsq_t *dns;
-    int paused;
-    const char *derr;
-    const fetch_cb_t *cb;
-    void *owner;
-    fetch_t *gnext, *gprev;
-};
-
-static fetch_t *g_fetches;
+static fetch_t *g_fetches = NULL;
 
 static void fetch_free(void *p)
 {
     fetch_t *f = p;
     buf_free(&f->req);
     buf_free(&f->head);
+    free(f->extra_hdrs);
+    free(f->post_body);
     free(f);
 }
 
@@ -514,7 +476,7 @@ static void fetch_kill(fetch_t *f)
     bury(fetch_free, f);
 }
 
-static void fetch_cancel(fetch_t *f)
+void fetch_cancel(fetch_t *f)
 {
     if (f)
         fetch_kill(f);
@@ -531,7 +493,6 @@ static void fetch_end(fetch_t *f, int ok, const char *err)
 
 static void fetch_begin(fetch_t *f);
 
-/* Start-up errors are reported from the next sweep so fetch_start() never calls back synchronously. */
 static void fetch_defer(fetch_t *f, const char *msg)
 {
     f->derr = msg;
@@ -550,7 +511,7 @@ static void fetch_connect(fetch_t *f, struct in_addr a)
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = htons(f->port);
+    sa.sin_port = htons((uint16_t)f->port);
     sa.sin_addr = a;
     f->ev.fd = fd;
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS) {
@@ -585,7 +546,8 @@ static void fetch_begin(fetch_t *f)
     f->req.len = 0;
     f->req_off = 0;
     int defport = (f->https && f->port == 443) || (!f->https && f->port == 80);
-    buf_fmt(&f->req, "GET %s HTTP/1.1\r\nHost: %s", f->target, f->host);
+    const char *meth = f->method[0] ? f->method : "GET";
+    buf_fmt(&f->req, "%s %s HTTP/1.1\r\nHost: %s", meth, f->target, f->host);
     if (!defport)
         buf_fmt(&f->req, ":%d", f->port);
     buf_fmt(&f->req,
@@ -594,7 +556,14 @@ static void fetch_begin(fetch_t *f)
             f->ua);
     if (f->auth[0])
         buf_fmt(&f->req, "Authorization: Basic %s\r\n", f->auth);
+    if (f->extra_hdrs && f->extra_hdrs[0])
+        buf_str(&f->req, f->extra_hdrs);
+    if (f->post_body || f->post_len > 0 || !strcasecmp(meth, "POST"))
+        buf_fmt(&f->req, "Content-Length: %zu\r\n", f->post_len);
     buf_str(&f->req, "\r\n");
+    if (f->post_body && f->post_len > 0)
+        buf_add(&f->req, f->post_body, f->post_len);
+
     f->st = F_DNS;
     f->deadline = g_now + f->conn_to;
     struct in_addr a;
@@ -608,8 +577,9 @@ static void fetch_begin(fetch_t *f)
         fetch_defer(f, "DNS queue failed");
 }
 
-static fetch_t *fetch_start(const char *url, const char *ua, const fetch_cb_t *cb, void *owner, double conn_to,
-                            double idle_to)
+fetch_t *fetch_start_ex(const char *method, const char *url, const char *ua,
+                        const char *extra_hdrs, const void *body, size_t body_len,
+                        const fetch_cb_t *cb, void *owner, double conn_to, double idle_to)
 {
     fetch_t *f = calloc(1, sizeof *f);
     if (!f)
@@ -617,8 +587,18 @@ static fetch_t *fetch_start(const char *url, const char *ua, const fetch_cb_t *c
     f->ev.type = EV_FETCH;
     f->ev.fd = -1;
     f->ev.obj = f;
+    snprintf(f->method, sizeof f->method, "%s", method && *method ? method : "GET");
     snprintf(f->url, sizeof f->url, "%s", url);
     snprintf(f->ua, sizeof f->ua, "%s", ua && *ua ? ua : "AstraG/2.0");
+    if (extra_hdrs && *extra_hdrs)
+        f->extra_hdrs = strdup(extra_hdrs);
+    if (body && body_len > 0) {
+        f->post_body = malloc(body_len);
+        if (f->post_body) {
+            memcpy(f->post_body, body, body_len);
+            f->post_len = body_len;
+        }
+    }
     f->cb = cb;
     f->owner = owner;
     f->conn_to = conn_to;
@@ -632,7 +612,13 @@ static fetch_t *fetch_start(const char *url, const char *ua, const fetch_cb_t *c
     return f;
 }
 
-static void fetch_pause(fetch_t *f, int on)
+fetch_t *fetch_start(const char *url, const char *ua, const fetch_cb_t *cb, void *owner, double conn_to,
+                     double idle_to)
+{
+    return fetch_start_ex("GET", url, ua, NULL, NULL, 0, cb, owner, conn_to, idle_to);
+}
+
+void fetch_pause(fetch_t *f, int on)
 {
     if (!f || f->ev.dead || f->paused == on)
         return;
@@ -684,14 +670,14 @@ static void fetch_body(fetch_t *f, const uint8_t *d, size_t n)
                     if (f->cst == 0 && c == ';')
                         f->cl[f->cll++] = 0;
                     else
-                        f->cl[f->cll++] = c;
+                        f->cl[f->cll++] = (char)c;
                 }
             } else if (f->cst == 1) {
                 size_t t = min_sz(n, (size_t)f->remain);
                 f->cb->data(f, d, t);
                 d += t;
                 n -= t;
-                f->remain -= t;
+                f->remain -= (int64_t)t;
                 if (f->remain == 0)
                     f->cst = 2;
             } else {
@@ -709,7 +695,7 @@ static void fetch_body(fetch_t *f, const uint8_t *d, size_t n)
             f->cb->data(f, d, t);
         if (f->ev.dead)
             return;
-        f->remain -= t;
+        f->remain -= (int64_t)t;
         if (f->remain <= 0)
             fetch_end(f, 1, NULL);
         return;
@@ -782,7 +768,7 @@ static void fetch_bytes(fetch_t *f, const uint8_t *d, size_t n)
                 fetch_end(f, 0, "response header too large");
             return;
         }
-        fetch_parse_head(f, e - f->head.p + 4);
+        fetch_parse_head(f, (size_t)(e - f->head.p + 4));
         return;
     }
     fetch_body(f, d, n);
@@ -844,7 +830,7 @@ static void fetch_read(fetch_t *f, int force)
             return;
         }
         f->deadline = g_now + f->idle_to;
-        fetch_bytes(f, rb, n);
+        fetch_bytes(f, rb, (size_t)n);
         if (!f->ssl && ++loops >= 4)
             return;
         if (force)
@@ -883,7 +869,7 @@ static int fetch_flush_req(fetch_t *f)
                 return -1;
             }
         }
-        f->req_off += n;
+        f->req_off += (size_t)n;
     }
     f->st = F_HEAD;
     f->deadline = g_now + f->idle_to;
@@ -990,27 +976,6 @@ static uint32_t crc32_mpeg(const uint8_t *d, size_t n)
     return c;
 }
 
-enum { K_NONE = 0, K_VIDEO = 1, K_AUDIO = 2, K_PMT = 3, K_OTHER = 4 };
-
-typedef struct psicap {
-    int pid;
-    uint8_t sec[1024];
-    int have, need;
-    uint8_t pk[4][TS];
-    int npk;
-    uint8_t done[4][TS];
-    int ndone;
-} psicap_t;
-
-typedef struct oseg {
-    int ref;
-    long long seq;
-    double dur;
-    int disc;
-    uint8_t *data;
-    size_t len;
-} oseg_t;
-
 static void oseg_unref(oseg_t *s)
 {
     if (s && --s->ref == 0) {
@@ -1019,78 +984,10 @@ static void oseg_unref(oseg_t *s)
     }
 }
 
-typedef struct front front_t;
-typedef struct hls hls_t;
-
-enum { IN_WAIT, IN_TS, IN_HLS, IN_IDLE };
-
-typedef struct channel {
-    char id[128], name[160];
-    char *urls[MAX_URLS];
-    int nurls, cur, fails_row;
-    double seg_target;
-    int seg_keep;
-    struct channel *next;
-    /* input */
-    int mode;
-    double retry_at, in_started, last_data, last_good;
-    fetch_t *tsf;
-    int ts_checked, probe_m3u;
-    buf_t probe;
-    hls_t *hls;
-    char last_error[256];
-    unsigned long long input_errors;
-    char ua[256];
-    int drop_sdt, drop_eit;
-    /* TS state */
-    uint8_t carry[TS];
-    int carry_n, synced;
-    int8_t in_cc[8192], out_cc[8192];
-    uint8_t kind[8192], stype[8192];
-    psicap_t caps[9];
-    int ncaps;
-    int pmt_pid[8], pnr[8], npmt, tsid;
-    int pcr_pid;
-    int64_t cur_pcr, br_pcr0;
-    uint64_t br_pos0;
-    double pcr_bitrate;
-    double gop; /* keyframe interval, seconds (decaying max) */
-    /* ring */
-    uint8_t *ring;
-    size_t rcap;
-    uint64_t wpos;
-    uint64_t kf_pos[KF_N];
-    int64_t kf_pcr[KF_N];
-    double kf_wall[KF_N];
-    int kf_head, kf_cnt;
-    double next_resize;
-    /* TS viewers / HLS waiters */
-    front_t *clients;
-    int nclients;
-    front_t *waiters;
-    double last_flush;
-    /* HLS out */
-    int hls_on, cur_started, cur_disc, disc_pending;
-    double hls_last_req, cur_t0_wall;
-    int64_t cur_t0_pcr;
-    oseg_t *segs[16];
-    int nsegs;
-    long long next_seq;
-    buf_t cseg;
-    /* stats */
-    uint64_t win_bytes, packets, cc_err, pes_err, sync_losses;
-    double win_start, bitrate;
-    int scr_win, scrambled;
-    /* on-demand */
-    int keep_active, idle_reported;
-    double idle_delay, last_client_act;
-} channel_t;
-
-static channel_t *g_channels;
-static buf_t g_scr;
-
-static channel_t *ch_find(const char *id)
+channel_t *ch_find(const char *id)
 {
+    if (!id)
+        return NULL;
     for (channel_t *c = g_channels; c; c = c->next)
         if (!strcmp(c->id, id))
             return c;
@@ -1193,8 +1090,8 @@ static void parse_pmt(channel_t *ch, const uint8_t *s, int sl)
             }
         }
         if (pid < 8191 && ch->kind[pid] != K_PMT) {
-            ch->kind[pid] = kind;
-            ch->stype[pid] = st;
+            ch->kind[pid] = (uint8_t)kind;
+            ch->stype[pid] = (uint8_t)st;
         }
         i += 5 + el;
     }
@@ -1215,13 +1112,13 @@ static void psi_push(channel_t *ch, int pid, const uint8_t *p, int off, int pusi
             return;
         c->need = 3 + sl;
         int take = TS - s < c->need ? TS - s : c->need;
-        memcpy(c->sec, p + s, take);
+        memcpy(c->sec, p + s, (size_t)take);
         c->have = take;
         c->npk = 0;
         memcpy(c->pk[c->npk++], p, TS);
     } else if (c->need && c->have < c->need && c->npk < 4) {
         int take = TS - off < c->need - c->have ? TS - off : c->need - c->have;
-        memcpy(c->sec + c->have, p + off, take);
+        memcpy(c->sec + c->have, p + off, (size_t)take);
         c->have += take;
         memcpy(c->pk[c->npk++], p, TS);
     } else {
@@ -1229,7 +1126,7 @@ static void psi_push(channel_t *ch, int pid, const uint8_t *p, int off, int pusi
     }
     if (c->need && c->have >= c->need) {
         int sl = c->need - 3;
-        if (crc32_mpeg(c->sec, c->need) == 0) {
+        if (crc32_mpeg(c->sec, (size_t)c->need) == 0) {
             if (pid == 0 && c->sec[0] == 0x00)
                 parse_pat(ch, c->sec, sl);
             else if (c->sec[0] == 0x02)
@@ -1273,7 +1170,6 @@ static int pes_is_kf(const uint8_t *p, int off, int st)
     return 0;
 }
 
-/* Returns 1 to keep the packet. Rewrites CC/discontinuity for HLS inputs so output is one continuous TS. */
 static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
 {
     int pid = ((p[1] & 0x1F) << 8) | p[2];
@@ -1315,14 +1211,14 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
     if (afc & 1) {
         if (ch->in_cc[pid] >= 0 && !disc && cc != ((ch->in_cc[pid] + 1) & 15) && cc != ch->in_cc[pid])
             ch->cc_err++;
-        ch->in_cc[pid] = cc;
+        ch->in_cc[pid] = (int8_t)cc;
         if (hls) {
             int o = ch->out_cc[pid] < 0 ? cc : ((ch->out_cc[pid] + 1) & 15);
-            ch->out_cc[pid] = o;
-            p[3] = (p[3] & 0xF0) | o;
+            ch->out_cc[pid] = (int8_t)o;
+            p[3] = (uint8_t)((p[3] & 0xF0) | o);
         }
     } else if (hls && ch->out_cc[pid] >= 0) {
-        p[3] = (p[3] & 0xF0) | ch->out_cc[pid];
+        p[3] = (uint8_t)((p[3] & 0xF0) | ch->out_cc[pid]);
     }
     if (scr)
         ch->scr_win = 1;
@@ -1337,9 +1233,9 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
         } else if (kind == K_NONE && startcode && pid > 0x1F && ch->npmt == 0) {
             int sid = p[off + 3];
             if (sid >= 0xE0 && sid <= 0xEF)
-                ch->kind[pid] = kind = K_VIDEO;
+                ch->kind[pid] = (uint8_t)(kind = K_VIDEO);
             else if ((sid >= 0xC0 && sid <= 0xDF) || sid == 0xBD)
-                ch->kind[pid] = kind = K_AUDIO;
+                ch->kind[pid] = (uint8_t)(kind = K_AUDIO);
         }
     }
     if (kind == K_VIDEO && !scr && (afc & 1) && ((pusi && pes_is_kf(p, off, ch->stype[pid])) || (rai && pusi && !ch->stype[pid])))
@@ -1348,6 +1244,14 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
 }
 
 /* ------------------------------------------------------------ channel ring */
+
+static uint64_t ring_low(channel_t *ch)
+{
+    if (!ch->ring || ch->rcap <= 64 * TS)
+        return ch->wpos;
+    uint64_t room = ch->rcap - 64 * TS;
+    return ch->wpos > room ? ch->wpos - room : 0;
+}
 
 static void ring_resize(channel_t *ch, size_t ncap)
 {
@@ -1359,11 +1263,11 @@ static void ring_resize(channel_t *ch, size_t ncap)
     uint8_t *nr = malloc(ncap);
     if (!nr)
         return;
-    uint64_t keep = min_sz(ch->wpos, min_sz(ch->rcap, ncap));
+    uint64_t keep = min_sz((size_t)min_sz((size_t)ch->wpos, ch->rcap), ncap);
     keep -= keep % TS;
     for (uint64_t p = ch->wpos - keep; p < ch->wpos;) {
-        size_t so = p % ch->rcap, dso = p % ncap;
-        size_t n = min_sz(min_sz(ch->rcap - so, ncap - dso), ch->wpos - p);
+        size_t so = (size_t)(p % ch->rcap), dso = (size_t)(p % ncap);
+        size_t n = min_sz(min_sz(ch->rcap - so, ncap - dso), (size_t)(ch->wpos - p));
         memcpy(nr + dso, ch->ring + so, n);
         p += n;
     }
@@ -1372,12 +1276,17 @@ static void ring_resize(channel_t *ch, size_t ncap)
     ch->rcap = ncap;
 }
 
-static uint64_t ring_low(channel_t *ch)
+static void prefix_build(channel_t *ch, buf_t *b)
 {
-    if (!ch->ring || ch->rcap <= 64 * TS)
-        return ch->wpos;
-    uint64_t room = ch->rcap - 64 * TS;
-    return ch->wpos > room ? ch->wpos - room : 0;
+    psicap_t *pat = cap_for(ch, 0, 0);
+    if (!pat || !pat->ndone)
+        return;
+    buf_add(b, pat->done, (size_t)pat->ndone * TS);
+    for (int i = 0; i < ch->npmt; i++) {
+        psicap_t *c = cap_for(ch, ch->pmt_pid[i], 0);
+        if (c && c->ndone)
+            buf_add(b, c->done, (size_t)c->ndone * TS);
+    }
 }
 
 static void ring_copy(channel_t *ch, buf_t *dst, uint64_t from, uint64_t to)
@@ -1385,23 +1294,10 @@ static void ring_copy(channel_t *ch, buf_t *dst, uint64_t from, uint64_t to)
     if (!ch->ring || !ch->rcap)
         return;
     while (from < to) {
-        size_t o = from % ch->rcap;
-        size_t n = min_sz(ch->rcap - o, to - from);
+        size_t o = (size_t)(from % ch->rcap);
+        size_t n = min_sz(ch->rcap - o, (size_t)(to - from));
         buf_add(dst, ch->ring + o, n);
         from += n;
-    }
-}
-
-static void prefix_build(channel_t *ch, buf_t *b)
-{
-    psicap_t *pat = cap_for(ch, 0, 0);
-    if (!pat || !pat->ndone)
-        return;
-    buf_add(b, pat->done, pat->ndone * TS);
-    for (int i = 0; i < ch->npmt; i++) {
-        psicap_t *c = cap_for(ch, ch->pmt_pid[i], 0);
-        if (c && c->ndone)
-            buf_add(b, c->done, c->ndone * TS);
     }
 }
 
@@ -1443,11 +1339,10 @@ static void seg_finish(channel_t *ch, double dur)
     s->len = ch->cseg.len;
     ch->cseg.p = NULL;
     ch->cseg.len = ch->cseg.cap = 0;
-    /* Segmenter always runs (like the Python engine) so a new HLS viewer gets a full window at once; idle channels keep 2. */
     int keep = g_now - ch->hls_last_req > 60.0 ? 3 : ch->seg_keep;
     while (ch->nsegs > 0 && (ch->nsegs == 16 || ch->nsegs >= keep)) {
         oseg_unref(ch->segs[0]);
-        memmove(ch->segs, ch->segs + 1, (ch->nsegs - 1) * sizeof ch->segs[0]);
+        memmove(ch->segs, ch->segs + 1, (size_t)(ch->nsegs - 1) * sizeof ch->segs[0]);
         ch->nsegs--;
     }
     ch->segs[ch->nsegs++] = s;
@@ -1475,7 +1370,9 @@ static void hls_out_feed(channel_t *ch, const uint8_t *s, size_t o, const size_t
             continue;
         }
         double d = seg_elapsed(ch, kfp[k]);
-        double target = ch->mode == IN_TS ? (ch->nsegs < 2 ? 1.0 : fmin(1.5, ch->seg_target * 0.6)) : ch->seg_target * 0.72;
+        double target = (ch->mode == IN_TS || ch->mode == IN_UDP)
+                            ? (ch->nsegs < 2 ? 1.0 : fmin(1.5, ch->seg_target * 0.6))
+                            : ch->seg_target * 0.72;
         if (d >= target) {
             buf_add(&ch->cseg, s + run, kfo[k] - run);
             seg_finish(ch, d);
@@ -1493,7 +1390,6 @@ static void hls_out_feed(channel_t *ch, const uint8_t *s, size_t o, const size_t
     }
 }
 
-/* First HLS request: build one segment from the ring so the playlist is usable immediately. */
 static void hls_out_activate(channel_t *ch)
 {
     ch->hls_on = 1;
@@ -1528,6 +1424,24 @@ static void hls_out_activate(channel_t *ch)
 
 /* --------------------------------------------------------------- TS feed */
 
+static void udp_outs_push(channel_t *ch, const uint8_t *pk, int flush)
+{
+    for (int u = 0; u < ch->n_udp_outs; u++) {
+        udp_out_t *uo = &ch->udp_outs[u];
+        if (uo->fd < 0)
+            continue;
+        if (pk) {
+            memcpy(uo->pkt + uo->n * TS, pk, TS);
+            uo->n++;
+        }
+        if (uo->n >= 7 || (flush && uo->n > 0)) {
+            sendto(uo->fd, uo->pkt, (size_t)uo->n * TS, MSG_NOSIGNAL,
+                   (struct sockaddr *)&uo->addr, sizeof uo->addr);
+            uo->n = 0;
+        }
+    }
+}
+
 static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
 {
     if (!n || !ch->ring || !ch->rcap)
@@ -1535,7 +1449,7 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
     ch->last_data = g_now;
     ch->win_bytes += n;
     g_scr.len = 0;
-    buf_add(&g_scr, ch->carry, ch->carry_n);
+    buf_add(&g_scr, ch->carry, (size_t)ch->carry_n);
     buf_add(&g_scr, d, n);
     ch->carry_n = 0;
     uint8_t *s = g_scr.p;
@@ -1556,6 +1470,8 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
             memmove(s + o, s + i, TS);
         int kf = 0;
         if (ts_packet(ch, s + o, hls, &kf)) {
+            if (ch->n_udp_outs > 0)
+                udp_outs_push(ch, s + o, 0);
             if (kf && nk < 64) {
                 kfo[nk] = o;
                 kfp[nk++] = ch->cur_pcr;
@@ -1564,6 +1480,8 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
         }
         i += TS;
     }
+    if (ch->n_udp_outs > 0)
+        udp_outs_push(ch, NULL, 1);
     size_t rem = len - i;
     if (rem >= TS)
         rem = TS - 1;
@@ -1576,7 +1494,7 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
     const uint8_t *src = s + (o - w);
     uint64_t p = base + (o - w);
     while (w) {
-        size_t ro = p % ch->rcap;
+        size_t ro = (size_t)(p % ch->rcap);
         size_t m = min_sz(w, ch->rcap - ro);
         memcpy(ch->ring + ro, src, m);
         src += m;
@@ -1611,7 +1529,7 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
             if (dt > 30 || dt < 0) {
                 ch->br_pcr0 = -1;
             } else if (dt >= 2.0) {
-                ch->pcr_bitrate = (ch->wpos - ch->br_pos0) * 8.0 / dt;
+                ch->pcr_bitrate = (double)(ch->wpos - ch->br_pos0) * 8.0 / dt;
                 ch->br_pcr0 = ch->cur_pcr;
                 ch->br_pos0 = ch->wpos;
             }
@@ -1620,94 +1538,7 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
     hls_out_feed(ch, s, o, kfo, kfp, nk);
 }
 
-/* ------------------------------------------------------------ control out */
-
-typedef struct ctl {
-    ev_t ev;
-    buf_t in, out;
-    int authed;
-} ctl_t;
-static ctl_t *g_ctl;
-static ev_t g_ctl_lev;
-
-static void ctl_flush(void);
-
-static void ctl_send(const char *fmt, ...)
-{
-    if (!g_ctl || !g_ctl->authed)
-        return;
-    if (g_ctl->out.len > 4u * 1024 * 1024)
-        return;
-    char tmp[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
-    va_end(ap);
-    if (n <= 0)
-        return;
-    if (n >= (int)sizeof tmp) {
-        n = sizeof tmp - 1;
-        tmp[n - 1] = '\n';
-    }
-    buf_add(&g_ctl->out, tmp, n);
-    ctl_flush();
-}
-
-/* Strip characters that would break the tab separated control protocol. */
-static void clean_field(char *s)
-{
-    for (; *s; s++)
-        if (*s == '\t' || *s == '\n' || *s == '\r')
-            *s = ' ';
-}
-
-/* --------------------------------------------------------- front (HTTP) */
-
-enum { FR_HEAD, FR_PROXY, FR_TS, FR_RESP, FR_WAIT };
-
-typedef struct up up_t;
-
-struct front {
-    ev_t ev;
-    int mode;
-    char ip[64];
-    buf_t in, out;
-    size_t out_off;
-    oseg_t *seg;
-    size_t seg_off;
-    up_t *up;
-    int ws, cl_eof, close_when_done, blocked;
-    double deadline;
-    char ua[200], login[96];
-    channel_t *ch;
-    uint64_t pos;
-    buf_t pre;
-    size_t pre_off;
-    int wait_kf;
-    double kf_deadline;
-    double last_progress;
-    unsigned long long sess;
-    char hls_pre[700], hls_suf[700];
-    int head_only;
-    double wait_until;
-    front_t *cnext, *cprev;
-    front_t *gnext, *gprev;
-};
-
-struct up {
-    ev_t ev;
-    front_t *fr;
-    int connecting, eof;
-    buf_t send;
-    size_t send_off;
-    buf_t hb;
-    int head_done, paused;
-};
-
-static front_t *g_fronts;
-
-static void up_close(up_t *u);
-static void front_flush(front_t *fr);
+/* --------------------------------------------------------- front (HTTP/WS) */
 
 static void front_free(void *p)
 {
@@ -1715,6 +1546,7 @@ static void front_free(void *p)
     buf_free(&fr->in);
     buf_free(&fr->out);
     buf_free(&fr->pre);
+    buf_free(&fr->ws_frag);
     free(fr);
 }
 
@@ -1729,18 +1561,23 @@ static void ch_list_remove(front_t **head, front_t *fr)
     fr->cnext = fr->cprev = NULL;
 }
 
-static void front_close(front_t *fr)
+void front_close(front_t *fr)
 {
-    if (fr->ev.dead)
+    if (!fr || fr->ev.dead)
         return;
     fr->ev.dead = 1;
-    if (fr->up)
-        up_close(fr->up);
-    if (fr->mode == FR_TS && fr->ch) {
+    if (fr->cfetch) {
+        fr->cfetch->owner = NULL;
+        fetch_cancel(fr->cfetch);
+        fr->cfetch = NULL;
+    }
+    if (fr->mode == FR_WS) {
+        ctl_ws_on_close(fr);
+    } else if (fr->mode == FR_TS && fr->ch) {
         fr->ch->last_client_act = g_now;
         ch_list_remove(&fr->ch->clients, fr);
         fr->ch->nclients--;
-        ctl_send("SESS-\t%llu\n", fr->sess);
+        ctl_on_sess_del(fr);
     } else if (fr->mode == FR_WAIT && fr->ch) {
         fr->ch->last_client_act = g_now;
         ch_list_remove(&fr->ch->waiters, fr);
@@ -1760,31 +1597,9 @@ static void front_close(front_t *fr)
     bury(front_free, fr);
 }
 
-static void up_free(void *p)
+void front_respond(front_t *fr, int code, const char *reason, const char *ctype, const char *extra,
+                   const void *body, size_t blen, oseg_t *seg, int head_only)
 {
-    up_t *u = p;
-    buf_free(&u->send);
-    buf_free(&u->hb);
-    free(u);
-}
-
-static void up_close(up_t *u)
-{
-    if (u->ev.dead)
-        return;
-    u->ev.dead = 1;
-    ev_close(&u->ev);
-    if (u->fr)
-        u->fr->up = NULL;
-    u->fr = NULL;
-    bury(up_free, u);
-}
-
-static void front_respond(front_t *fr, int code, const char *reason, const char *ctype, const char *extra,
-                          const void *body, size_t blen, oseg_t *seg, int head_only)
-{
-    if (fr->up)
-        up_close(fr->up);
     fr->mode = FR_RESP;
     fr->out.len = 0;
     fr->out_off = 0;
@@ -1798,23 +1613,36 @@ static void front_respond(front_t *fr, int code, const char *reason, const char 
             seg->ref++;
             fr->seg = seg;
             fr->seg_off = 0;
-        } else {
+        } else if (body && blen > 0) {
             buf_add(&fr->out, body, blen);
         }
     }
     front_flush(fr);
 }
 
-static void front_error(front_t *fr, int code, const char *reason)
+void front_respond_status_raw(front_t *fr, int code, const char *reason,
+                              const char *headers, const void *body, size_t blen)
 {
-    char body[128];
-    int n = snprintf(body, sizeof body, "{\"detail\":\"%s\"}", reason);
-    front_respond(fr, code, reason, "application/json", code == 503 ? "Retry-After: 1\r\n" : NULL, body, n, NULL,
-                  0);
+    fr->mode = FR_RESP;
+    fr->out.len = 0;
+    fr->out_off = 0;
+    buf_fmt(&fr->out,
+            "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n%sConnection: close\r\n\r\n",
+            code, reason ? reason : "OK", blen, headers ? headers : "");
+    if (body && blen > 0)
+        buf_add(&fr->out, body, blen);
+    front_flush(fr);
 }
 
-/* Send pending proxy/fixed response bytes. */
-static void front_flush(front_t *fr)
+void front_error(front_t *fr, int code, const char *reason)
+{
+    char body[256];
+    int n = snprintf(body, sizeof body, "{\"detail\":\"%s\"}", reason ? reason : "Error");
+    front_respond(fr, code, reason ? reason : "Error", "application/json",
+                  code == 503 ? "Retry-After: 1\r\n" : NULL, body, (size_t)n, NULL, 0);
+}
+
+void front_flush(front_t *fr)
 {
     if (fr->ev.dead)
         return;
@@ -1834,7 +1662,7 @@ static void front_flush(front_t *fr)
         ssize_t w = writev(fr->ev.fd, iov, n);
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ev_watch(&fr->ev, EPOLLOUT | (fr->mode == FR_PROXY && !fr->cl_eof ? EPOLLIN : 0));
+                ev_watch(&fr->ev, EPOLLOUT | (fr->mode == FR_WS ? EPOLLIN : 0));
                 return;
             }
             front_close(fr);
@@ -1842,33 +1670,159 @@ static void front_flush(front_t *fr)
         }
         size_t a = min_sz((size_t)w, fr->out.len - fr->out_off);
         fr->out_off += a;
-        w -= a;
+        w -= (ssize_t)a;
         if (w && fr->seg)
-            fr->seg_off += w;
+            fr->seg_off += (size_t)w;
         fr->deadline = g_now + 60;
     }
     fr->out.len = 0;
     fr->out_off = 0;
-    if (fr->mode == FR_RESP) {
+    if (fr->mode == FR_RESP || fr->close_when_done) {
         front_close(fr);
         return;
     }
-    if (fr->mode == FR_PROXY) {
-        if (!fr->up) {
-            front_close(fr);
+    if (fr->mode == FR_WS) {
+        ev_watch(&fr->ev, EPOLLIN);
+    }
+}
+
+/* ---- WebSocket RFC 6455 */
+
+void ws_upgrade(front_t *fr, const char *accept_b64, int is_cluster, const char *cluster_host)
+{
+    fr->mode = FR_WS;
+    fr->ws_is_cluster = is_cluster;
+    fr->ws_authed = 0;
+    fr->ws_admin = 0;
+    fr->ws_login[0] = 0;
+    snprintf(fr->ws_cluster_host, sizeof fr->ws_cluster_host, "%s", cluster_host ? cluster_host : "");
+    fr->in.len = 0;
+    fr->out.len = 0;
+    fr->out_off = 0;
+    fr->deadline = g_now + 300.0;
+    buf_fmt(&fr->out,
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n\r\n",
+            accept_b64);
+    front_flush(fr);
+}
+
+static void ws_queue_frame(front_t *fr, uint8_t opcode, const void *payload, size_t len)
+{
+    if (!fr || fr->ev.dead || fr->mode != FR_WS)
+        return;
+    if (fr->out.len - fr->out_off > 4u * 1024 * 1024) {
+        front_close(fr);
+        return;
+    }
+    uint8_t hdr[10];
+    size_t hl = 2;
+    hdr[0] = (uint8_t)(0x80 | (opcode & 0x0F));
+    if (len < 126) {
+        hdr[1] = (uint8_t)len;
+    } else if (len <= 65535) {
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)((len >> 8) & 0xFF);
+        hdr[3] = (uint8_t)(len & 0xFF);
+        hl = 4;
+    } else {
+        hdr[1] = 127;
+        uint64_t l64 = (uint64_t)len;
+        for (int i = 0; i < 8; i++)
+            hdr[2 + i] = (uint8_t)((l64 >> (56 - 8 * i)) & 0xFF);
+        hl = 10;
+    }
+    buf_add(&fr->out, hdr, hl);
+    if (payload && len > 0)
+        buf_add(&fr->out, payload, len);
+    front_flush(fr);
+}
+
+void ws_send_text(front_t *fr, const char *txt, size_t len)
+{
+    ws_queue_frame(fr, 0x1, txt, len);
+}
+
+void ws_send_close(front_t *fr, uint16_t code)
+{
+    if (!fr || fr->ev.dead || fr->mode != FR_WS)
+        return;
+    uint8_t p[2] = {(uint8_t)(code >> 8), (uint8_t)(code & 0xFF)};
+    fr->close_when_done = 1;
+    ws_queue_frame(fr, 0x8, p, 2);
+}
+
+static void ws_consume_frames(front_t *fr)
+{
+    while (!fr->ev.dead && fr->mode == FR_WS && fr->in.len >= 2) {
+        uint8_t *b = fr->in.p;
+        int fin = (b[0] >> 7) & 1;
+        int op = b[0] & 0x0F;
+        int masked = (b[1] >> 7) & 1;
+        uint64_t plen = b[1] & 0x7F;
+        size_t pos = 2;
+        if (plen == 126) {
+            if (fr->in.len < pos + 2)
+                return;
+            plen = ((uint64_t)b[pos] << 8) | b[pos + 1];
+            pos += 2;
+        } else if (plen == 127) {
+            if (fr->in.len < pos + 8)
+                return;
+            plen = 0;
+            for (int i = 0; i < 8; i++)
+                plen = (plen << 8) | b[pos + i];
+            pos += 8;
+        }
+        if (plen > 2u * 1024 * 1024) {
+            ws_send_close(fr, 1009);
             return;
         }
-        if (fr->up->paused) {
-            fr->up->paused = 0;
-            ev_watch(&fr->up->ev, EPOLLIN | (fr->up->send_off < fr->up->send.len ? EPOLLOUT : 0));
+        uint8_t mask[4] = {0, 0, 0, 0};
+        if (masked) {
+            if (fr->in.len < pos + 4)
+                return;
+            memcpy(mask, b + pos, 4);
+            pos += 4;
         }
-        ev_watch(&fr->ev, fr->cl_eof ? 0 : EPOLLIN);
+        if (fr->in.len < pos + (size_t)plen)
+            return;
+        uint8_t *payload = b + pos;
+        if (masked) {
+            for (size_t i = 0; i < (size_t)plen; i++)
+                payload[i] ^= mask[i & 3];
+        }
+        size_t total_frame = pos + (size_t)plen;
+        if (op == 0x8) {
+            fr->close_when_done = 1;
+            ws_queue_frame(fr, 0x8, plen >= 2 ? payload : NULL, plen >= 2 ? 2 : 0);
+            return;
+        } else if (op == 0x9) {
+            ws_queue_frame(fr, 0xA, payload, (size_t)plen);
+        } else if (op == 0xA) {
+            /* pong */
+        } else if (op == 0x1 || op == 0x2 || op == 0x0) {
+            if (op != 0x0) {
+                fr->ws_frag.len = 0;
+                fr->ws_frag_op = (uint8_t)op;
+            }
+            if (fr->ws_frag.len + (size_t)plen <= 2u * 1024 * 1024)
+                buf_add(&fr->ws_frag, payload, (size_t)plen);
+            if (fin) {
+                buf_add(&fr->ws_frag, "", 1);
+                ctl_ws_on_message(fr, (const char *)fr->ws_frag.p, fr->ws_frag.len - 1);
+                fr->ws_frag.len = 0;
+            }
+        }
+        if (!fr->ev.dead)
+            buf_drop(&fr->in, total_frame);
     }
 }
 
 /* ---- TS viewers */
 
-/* Media seconds between keyframe slot idx and the live edge (PCR when sane, wall clock otherwise). */
 static double kf_age(channel_t *ch, int idx)
 {
     if (ch->kf_pcr[idx] >= 0 && ch->cur_pcr >= 0) {
@@ -1879,8 +1833,6 @@ static double kf_age(channel_t *ch, int idx)
     return g_now - ch->kf_wall[idx];
 }
 
-/* New viewers start at a keyframe ~START_BURST_S behind live so the player's buffer begins full
- * (Python engine sent the last whole segment; 1 s of burst underran VLC's default 1 s cache). */
 #define START_BURST_S 3.5
 
 static uint64_t pick_start(channel_t *ch)
@@ -1900,12 +1852,11 @@ static uint64_t pick_start(channel_t *ch)
     }
     if (cand >= 0)
         return (uint64_t)cand;
-    uint64_t back = min_sz(ch->wpos - lo, 512 * 1024);
+    uint64_t back = min_sz((size_t)(ch->wpos - lo), 512 * 1024);
     back -= back % TS;
     return ch->wpos - back;
 }
 
-/* Prefix PSI packets get CC values that continue into the stream at `start`. */
 static void client_prefix(channel_t *ch, buf_t *pre, uint64_t start)
 {
     size_t base = pre->len;
@@ -1943,7 +1894,7 @@ static void client_prefix(channel_t *ch, buf_t *pre, uint64_t start)
             uint8_t *p = pre->p + base + k * TS;
             if ((((p[1] & 0x1F) << 8) | p[2]) == pids[j]) {
                 c = (c - 1) & 15;
-                p[3] = (p[3] & 0xF0) | c;
+                p[3] = (uint8_t)((p[3] & 0xF0) | c);
             }
         }
     }
@@ -2004,13 +1955,13 @@ static void client_send(front_t *c)
         if (avail > 4u * 1024 * 1024)
             avail = 4u * 1024 * 1024;
         if (avail) {
-            size_t a = c->pos % ch->rcap;
-            size_t first = min_sz(avail, ch->rcap - a);
+            size_t a = (size_t)(c->pos % ch->rcap);
+            size_t first = min_sz((size_t)avail, ch->rcap - a);
             iov[n].iov_base = ch->ring + a;
             iov[n++].iov_len = first;
             if (avail > first) {
                 iov[n].iov_base = ch->ring;
-                iov[n++].iov_len = avail - first;
+                iov[n++].iov_len = (size_t)avail - first;
             }
         }
         if (!n) {
@@ -2036,7 +1987,7 @@ static void client_send(front_t *c)
             c->pre_off = 0;
         }
         c->pos += (size_t)w - a;
-        if ((size_t)w < prelen + avail) {
+        if ((size_t)w < prelen + (size_t)avail) {
             c->blocked = 1;
             ev_watch(&c->ev, EPOLLIN | EPOLLOUT);
             return;
@@ -2044,14 +1995,12 @@ static void client_send(front_t *c)
     }
 }
 
-static void start_ts_client(front_t *fr, channel_t *ch, const char *login)
+void ch_serve_ts(front_t *fr, channel_t *ch, const char *login)
 {
-    if (fr->up)
-        up_close(fr->up);
+    ch_wake(ch);
     fr->mode = FR_TS;
     fr->ch = ch;
     snprintf(fr->login, sizeof fr->login, "%s", login ? login : "");
-    clean_field(fr->login);
     fr->pre.len = 0;
     fr->pre_off = 0;
     buf_str(&fr->pre, "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store, no-cache, "
@@ -2073,12 +2022,12 @@ static void start_ts_client(front_t *fr, channel_t *ch, const char *login)
     ch->clients = fr;
     ch->nclients++;
     fr->sess = ++g_sess_seq;
+    fr->sess_start_wall = time(NULL);
+    fr->sess_sdate_ms = (int64_t)fr->sess_start_wall * 1000LL;
     fr->last_progress = g_now;
-    ctl_send("SESS+\t%llu\t%s\t%s\t%s\t%s\n", fr->sess, ch->id, fr->ip, fr->login, fr->ua);
+    ctl_on_sess_add(fr, ch);
     client_send(fr);
 }
-
-/* ---- HLS output responses */
 
 static void send_playlist(front_t *fr, channel_t *ch)
 {
@@ -2113,289 +2062,95 @@ static void wait_remove(front_t *fr)
     }
 }
 
-static void split_tabs(char *s, char **f, int maxf, int *nf)
+void ch_serve_hls(front_t *fr, channel_t *ch, const char *pre, const char *suf, int head_only)
 {
-    *nf = 0;
-    while (*nf < maxf) {
-        f[(*nf)++] = s;
-        char *t = strchr(s, '\t');
-        if (!t)
-            break;
-        *t = 0;
-        s = t + 1;
-    }
-}
-
-static int hexval(int c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    c |= 0x20;
-    return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
-static void pct_decode(char *s)
-{
-    char *o = s;
-    for (; *s; s++) {
-        int h, l;
-        if (*s == '%' && (h = hexval(s[1])) >= 0 && (l = hexval(s[2])) >= 0) {
-            *o++ = (char)(h * 16 + l);
-            s += 2;
-        } else {
-            *o++ = *s;
-        }
-    }
-    *o = 0;
-}
-
-static void ch_wake(channel_t *ch);
-
-static void handle_directive(front_t *fr, char *dir)
-{
-    char *f[8];
-    int nf = 0;
-    while (nf < 8) {
-        f[nf++] = dir;
-        char *t = strchr(dir, '|');
-        if (!t)
-            break;
-        *t = 0;
-        dir = t + 1;
-    }
-    for (int i = 0; i < nf; i++)
-        pct_decode(f[i]);
-    channel_t *ch = nf >= 2 ? ch_find(f[1]) : NULL;
-    if (!ch) {
-        front_error(fr, 404, "Stream not found");
+    int was_idle = (ch->mode == IN_IDLE);
+    ch_wake(ch);
+    snprintf(fr->hls_pre, sizeof fr->hls_pre, "%s", pre ? pre : "");
+    snprintf(fr->hls_suf, sizeof fr->hls_suf, "%s", suf ? suf : "");
+    fr->head_only = head_only;
+    ch->hls_last_req = g_now;
+    if (!ch->hls_on)
+        hls_out_activate(ch);
+    if (ch->nsegs >= 3) {
+        send_playlist(fr, ch);
         return;
     }
-    if (!strcmp(f[0], "ts")) {
-        ch_wake(ch);
-        start_ts_client(fr, ch, nf >= 3 ? f[2] : "");
-        return;
-    }
-    if (!strcmp(f[0], "hls")) {
-        int was_idle = (ch->mode == IN_IDLE);
-        ch_wake(ch);
-        snprintf(fr->hls_pre, sizeof fr->hls_pre, "%s", nf >= 3 ? f[2] : "");
-        snprintf(fr->hls_suf, sizeof fr->hls_suf, "%s", nf >= 4 ? f[3] : "");
-        fr->head_only = nf >= 5 && !strcmp(f[4], "HEAD");
-        ch->hls_last_req = g_now;
-        if (!ch->hls_on)
-            hls_out_activate(ch);
-        if (ch->nsegs >= 3) {
-            send_playlist(fr, ch);
-            return;
-        }
-        if (fr->up)
-            up_close(fr->up);
-        fr->mode = FR_WAIT;
-        fr->ch = ch;
-        fr->wait_until = g_now + (was_idle || ch->wpos == 0 ? fmax(ch->seg_target * 3.0 + 6.0, 14.0) : ch->seg_target * 2.0 + 3.0);
-        fr->cnext = ch->waiters;
-        if (ch->waiters)
-            ch->waiters->cprev = fr;
-        ch->waiters = fr;
-        ev_watch(&fr->ev, EPOLLIN);
-        return;
-    }
-    if (!strcmp(f[0], "seg") && nf >= 3) {
-        ch_wake(ch);
-        ch->hls_last_req = g_now;
-        long long n = -1;
-        if (!strncmp(f[2], "segment-", 8))
-            n = atoll(f[2] + 8);
-        for (int i = 0; i < ch->nsegs; i++)
-            if (ch->segs[i]->seq == n) {
-                front_respond(fr, 200, "OK", "video/mp2t", "Cache-Control: public, max-age=60\r\n", NULL, 0,
-                              ch->segs[i], nf >= 4 && !strcmp(f[3], "HEAD"));
-                return;
-            }
-        front_error(fr, 404, "Segment not found or expired");
-        return;
-    }
-    front_error(fr, 500, "Bad core directive");
-}
-
-/* ---- proxy to the Python control server */
-
-static const char *hdr_skip[] = {"connection", "keep-alive", "proxy-connection", "x-forwarded-for",
-                                 "x-astrag-via", "x-astrag-core", NULL};
-
-static void up_on_event(up_t *u, uint32_t evs);
-
-static void start_proxy(front_t *fr, size_t hl)
-{
-    char *h = (char *)fr->in.p;
-    up_t *u = calloc(1, sizeof *u);
-    if (!u) {
-        front_close(fr);
-        return;
-    }
-    u->ev.type = EV_UP;
-    u->ev.obj = u;
-    u->fr = fr;
-    fr->up = u;
-    fr->mode = FR_PROXY;
-    char *eol = memchr(h, '\n', hl);
-    size_t first = eol ? (size_t)(eol - h + 1) : hl;
-    buf_add(&u->send, h, first);
-    int upgrade = 0;
-    char *line = h + first;
-    char *end = h + hl - 2;
-    while (line < end) {
-        char *e = memchr(line, '\n', end - line);
-        size_t ll = e ? (size_t)(e - line + 1) : (size_t)(end - line);
-        char name[64];
-        size_t nl = strcspn(line, ":\r\n");
-        if (nl < sizeof name && nl < ll) {
-            memcpy(name, line, nl);
-            name[nl] = 0;
-            int skip = 0;
-            for (int i = 0; hdr_skip[i]; i++)
-                if (!strcasecmp(name, hdr_skip[i]))
-                    skip = 1;
-            if (!strcasecmp(name, "upgrade"))
-                upgrade = 1;
-            if (!strcasecmp(name, "user-agent")) {
-                const char *v = line + nl + 1;
-                while (*v == ' ')
-                    v++;
-                size_t vl = strcspn(v, "\r\n");
-                snprintf(fr->ua, sizeof fr->ua, "%.*s", (int)vl, v);
-                clean_field(fr->ua);
-            }
-            if (!skip)
-                buf_add(&u->send, line, ll);
-        }
-        line += ll;
-    }
-    fr->ws = upgrade;
-    buf_fmt(&u->send, "Connection: %s\r\nX-Forwarded-For: %s\r\nX-Astrag-Via: %s\r\n\r\n",
-            upgrade ? "Upgrade" : "close", fr->ip, g_secret);
-    if (fr->in.len > hl)
-        buf_add(&u->send, fr->in.p + hl, fr->in.len - hl);
-    fr->in.len = 0;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(g_upstream_port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    u->ev.fd = fd;
-    if (fd < 0 || (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS)) {
-        front_error(fr, 502, "Control server unavailable");
-        return;
-    }
-    u->connecting = 1;
-    ev_watch(&u->ev, EPOLLOUT);
+    fr->mode = FR_WAIT;
+    fr->ch = ch;
+    fr->wait_until = g_now + (was_idle || ch->wpos == 0 ? fmax(ch->seg_target * 3.0 + 6.0, 14.0) : ch->seg_target * 2.0 + 3.0);
+    fr->cnext = ch->waiters;
+    if (ch->waiters)
+        ch->waiters->cprev = fr;
+    ch->waiters = fr;
     ev_watch(&fr->ev, EPOLLIN);
-    fr->deadline = g_now + 120;
 }
 
-static void up_flush_send(up_t *u)
+void ch_serve_seg(front_t *fr, channel_t *ch, const char *seg_name, int head_only)
 {
-    while (u->send_off < u->send.len) {
-        ssize_t n = send(u->ev.fd, u->send.p + u->send_off, u->send.len - u->send_off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ev_watch(&u->ev, (u->paused ? 0 : EPOLLIN) | EPOLLOUT);
-                return;
-            }
-            front_t *fr = u->fr;
-            up_close(u);
-            if (fr)
-                front_close(fr);
+    ch_wake(ch);
+    ch->hls_last_req = g_now;
+    long long n = -1;
+    if (seg_name && !strncmp(seg_name, "segment-", 8))
+        n = atoll(seg_name + 8);
+    for (int i = 0; i < ch->nsegs; i++) {
+        if (ch->segs[i]->seq == n) {
+            front_respond(fr, 200, "OK", "video/mp2t", "Cache-Control: public, max-age=60\r\n",
+                          NULL, 0, ch->segs[i], head_only);
             return;
         }
-        u->send_off += n;
     }
-    u->send.len = 0;
-    u->send_off = 0;
-    ev_watch(&u->ev, u->paused ? 0 : EPOLLIN);
+    front_error(fr, 404, "Segment not found or expired");
 }
 
-static void up_on_event(up_t *u, uint32_t evs)
+static void parse_front_request(front_t *fr)
 {
-    front_t *fr = u->fr;
-    if (!fr) {
-        up_close(u);
-        return;
-    }
-    if (u->connecting) {
-        int err = 0;
-        socklen_t l = sizeof err;
-        getsockopt(u->ev.fd, SOL_SOCKET, SO_ERROR, &err, &l);
-        if (err) {
-            front_error(fr, 502, "Control server unavailable");
-            return;
-        }
-        u->connecting = 0;
-    }
-    if (evs & EPOLLOUT)
-        up_flush_send(u);
-    if (u->ev.dead || !(evs & (EPOLLIN | EPOLLHUP | EPOLLERR)))
-        return;
-    uint8_t rb[65536];
-    ssize_t n = recv(u->ev.fd, rb, sizeof rb, 0);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return;
-        n = 0;
-    }
-    if (n == 0) {
-        u->eof = 1;
-        int had_head = u->head_done;
-        up_close(u);
-        if (!had_head)
-            front_error(fr, 502, "Bad gateway");
-        else if (fr->out_off >= fr->out.len)
-            front_close(fr);
-        else
-            fr->mode = FR_RESP;
-        return;
-    }
-    if (!u->head_done) {
-        buf_add(&u->hb, rb, n);
-        uint8_t *e = memmem(u->hb.p, u->hb.len, "\r\n\r\n", 4);
+    if (fr->mode == FR_HEAD) {
+        uint8_t *e = memmem(fr->in.p, fr->in.len, "\r\n\r\n", 4);
         if (!e) {
-            if (u->hb.len > 65536)
-                front_error(fr, 502, "Bad gateway");
+            if (fr->in.len > 65536)
+                front_error(fr, 431, "Request header too large");
             return;
         }
-        size_t hl = e - u->hb.p + 4;
-        char *hd = NULL;
-        for (size_t i = 0; i + 16 <= hl; i++)
-            if (u->hb.p[i] == '\n' && !strncasecmp((char *)u->hb.p + i + 1, "x-astrag-core:", 14)) {
-                hd = (char *)u->hb.p + i;
-                break;
+        size_t hl = (size_t)(e - fr->in.p + 4);
+        int64_t clen = 0;
+        char *h = (char *)fr->in.p;
+        char *line = memchr(h, '\n', hl);
+        while (line && (size_t)(line - h + 1) < hl) {
+            line++;
+            char *eol = memchr(line, '\n', hl - (size_t)(line - h));
+            size_t ll = eol ? (size_t)(eol - line) : (hl - (size_t)(line - h));
+            if (ll >= 16 && !strncasecmp(line, "content-length:", 15)) {
+                clen = strtoll(line + 15, NULL, 10);
+                if (clen < 0)
+                    clen = 0;
             }
-        if (hd) {
-            char *v = hd + 15;
-            while (*v == ' ')
-                v++;
-            size_t vl = 0;
-            while ((uint8_t *)v + vl < u->hb.p + hl && v[vl] != '\r' && v[vl] != '\n')
-                vl++;
-            char dir[2048];
-            snprintf(dir, sizeof dir, "%.*s", (int)vl, v);
-            up_close(u);
-            fr->deadline = g_now + 60;
-            handle_directive(fr, dir);
+            if (ll >= 11 && !strncasecmp(line, "user-agent:", 11)) {
+                const char *v = line + 11;
+                while ((size_t)(v - line) < ll && (*v == ' ' || *v == '\t'))
+                    v++;
+                size_t vl = (size_t)(line + ll - v);
+                if (vl && v[vl - 1] == '\r')
+                    vl--;
+                snprintf(fr->ua, sizeof fr->ua, "%.*s", (int)vl, v);
+            }
+            line = eol;
+        }
+        if (clen > 16 * 1024 * 1024) {
+            front_error(fr, 413, "Payload too large");
             return;
         }
-        u->head_done = 1;
-        buf_add(&fr->out, u->hb.p, u->hb.len);
-        u->hb.len = 0;
-    } else {
-        buf_add(&fr->out, rb, n);
+        fr->head_len = hl;
+        fr->body_need = clen;
+        fr->mode = FR_BODY;
+        fr->deadline = g_now + 30.0;
     }
-    if (fr->out.len - fr->out_off > 1024 * 1024) {
-        u->paused = 1;
-        ev_watch(&u->ev, u->send_off < u->send.len ? EPOLLOUT : 0);
+    if (fr->mode == FR_BODY) {
+        if (fr->in.len < fr->head_len + (size_t)fr->body_need)
+            return;
+        fr->deadline = g_now + 60.0;
+        ctl_http_handle(fr, fr->head_len, (size_t)fr->body_need);
     }
-    front_flush(fr);
 }
 
 static void front_on_event(front_t *fr, uint32_t evs)
@@ -2413,7 +2168,7 @@ static void front_on_event(front_t *fr, uint32_t evs)
             client_send(fr);
         return;
     }
-    if (fr->mode == FR_WAIT || fr->mode == FR_RESP) {
+    if (fr->mode == FR_WAIT || fr->mode == FR_RESP || fr->mode == FR_CFETCH) {
         if (evs & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
             uint8_t tmp[4096];
             ssize_t n = recv(fr->ev.fd, tmp, sizeof tmp, 0);
@@ -2440,31 +2195,17 @@ static void front_on_event(front_t *fr, uint32_t evs)
         return;
     }
     if (n == 0) {
-        if (fr->mode == FR_HEAD || fr->ws) {
-            front_close(fr);
-            return;
-        }
-        fr->cl_eof = 1;
-        ev_watch(&fr->ev, fr->out_off < fr->out.len ? EPOLLOUT : 0);
+        front_close(fr);
         return;
     }
-    if (fr->mode == FR_HEAD) {
-        buf_add(&fr->in, rb, n);
-        uint8_t *e = memmem(fr->in.p, fr->in.len, "\r\n\r\n", 4);
-        if (!e) {
-            if (fr->in.len > 32768)
-                front_error(fr, 431, "Request header too large");
-            return;
-        }
-        start_proxy(fr, e - fr->in.p + 4);
+    if (fr->mode == FR_WS) {
+        fr->deadline = g_now + 300.0;
+        buf_add(&fr->in, rb, (size_t)n);
+        ws_consume_frames(fr);
         return;
     }
-    if (fr->mode == FR_PROXY && fr->up) {
-        up_t *u = fr->up;
-        buf_add(&u->send, rb, n);
-        if (!u->connecting)
-            up_flush_send(u);
-    }
+    buf_add(&fr->in, rb, (size_t)n);
+    parse_front_request(fr);
 }
 
 /* ------------------------------------------------------------- listeners */
@@ -2475,7 +2216,7 @@ typedef struct listener {
     int port;
     struct listener *next;
 } listener_t;
-static listener_t *g_listeners;
+static listener_t *g_listeners = NULL;
 
 static int listen_open(const char *host, int port)
 {
@@ -2501,21 +2242,29 @@ static int listen_open(const char *host, int port)
     return fd;
 }
 
-static int listener_add(const char *host, int port)
+int listener_has(int port)
+{
+    for (listener_t *l = g_listeners; l; l = l->next)
+        if (l->port == port)
+            return 1;
+    return 0;
+}
+
+int listener_add(const char *host, int port)
 {
     for (listener_t *l = g_listeners; l; l = l->next)
         if (l->port == port)
             return 0;
     int fd = listen_open(host, port);
     if (fd < 0) {
-        LOG("cannot listen on %s:%d: %s", host, port, strerror(errno));
+        ELOG("cannot listen on %s:%d: %s", host ? host : "0.0.0.0", port, strerror(errno));
         return -1;
     }
     listener_t *l = calloc(1, sizeof *l);
     l->ev.type = EV_LISTEN;
     l->ev.fd = fd;
     l->ev.obj = l;
-    snprintf(l->host, sizeof l->host, "%s", host);
+    snprintf(l->host, sizeof l->host, "%s", host ? host : "0.0.0.0");
     l->port = port;
     l->next = g_listeners;
     g_listeners = l;
@@ -2523,7 +2272,7 @@ static int listener_add(const char *host, int port)
     return 0;
 }
 
-static void listener_del(int port)
+void listener_del(int port)
 {
     for (listener_t **pp = &g_listeners; *pp; pp = &(*pp)->next)
         if ((*pp)->port == port) {
@@ -2544,6 +2293,8 @@ static void on_accept(listener_t *l)
         int fd = accept4(l->ev.fd, (struct sockaddr *)&ss, &sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0)
             return;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         front_t *fr = calloc(1, sizeof *fr);
         if (!fr) {
             close(fd);
@@ -2553,6 +2304,7 @@ static void on_accept(listener_t *l)
         fr->ev.fd = fd;
         fr->ev.obj = fr;
         fr->mode = FR_HEAD;
+        fr->listen_port = l->port;
         fr->deadline = g_now + 20;
         if (ss.ss_family == AF_INET)
             inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, fr->ip, sizeof fr->ip);
@@ -2616,7 +2368,11 @@ struct hls {
     uint64_t seen[256];
     int seen_i;
     double avg_bps;
-    struct { char url[4096]; uint8_t key[16]; int ok; } keys[4];
+    struct {
+        char url[4096];
+        uint8_t key[16];
+        int ok;
+    } keys[4];
     int key_i;
 };
 
@@ -2632,17 +2388,16 @@ static uint64_t fnv(const char *s, size_t n)
     return h;
 }
 
-/* Dedup key ignores volatile auth query parameters (same rule as the Python engine). */
 static uint64_t seg_key(const char *url)
 {
     const char *q = strchr(url, '?');
     if (!q)
         return fnv(url, strlen(url));
     if (q - url >= 3 && !strncasecmp(q - 3, ".ts", 3))
-        return fnv(url, q - url);
+        return fnv(url, (size_t)(q - url));
     static const char *drop[] = {"token", "md5", "auth", "wmsauthsign", "expires", "vtoken", "signature",
                                  "hash", "key", NULL};
-    uint64_t h = fnv(url, q - url);
+    uint64_t h = fnv(url, (size_t)(q - url));
     const char *p = q + 1;
     while (*p) {
         size_t n = strcspn(p, "&");
@@ -2741,7 +2496,7 @@ static double hls_rate(hls_t *h)
 {
     slot_t *s = h->sh;
     if (s && s->clen > 0 && s->q->dur > 0.2)
-        return s->clen / s->q->dur;
+        return (double)s->clen / s->q->dur;
     if (h->avg_bps > 0)
         return h->avg_bps;
     if (h->ch->pcr_bitrate > 100000)
@@ -2758,7 +2513,6 @@ static size_t hls_cap(hls_t *h)
 
 static void hls_check_pause(hls_t *h)
 {
-    /* The head segment always keeps downloading: pausing it while a lookahead fills the cap would deadlock. */
     int full = hls_total(h) >= hls_cap(h);
     for (slot_t *s = h->sh; s; s = s->next)
         if (s->f)
@@ -2827,7 +2581,7 @@ static void seg_data(fetch_t *f, const uint8_t *d, size_t n)
             size_t t = min_sz(n, 65536);
             int ol = 0;
             EVP_DecryptUpdate(s->dec, out, &ol, d, (int)t);
-            slot_append(s, out, ol);
+            slot_append(s, out, (size_t)ol);
             d += t;
             n -= t;
         }
@@ -2848,7 +2602,7 @@ static void seg_done(fetch_t *f, int ok, const char *err)
         uint8_t out[64];
         int ol = 0;
         if (EVP_DecryptFinal_ex(s->dec, out, &ol) == 1)
-            slot_append(s, out, ol);
+            slot_append(s, out, (size_t)ol);
     }
     if (f->status == 404 || f->status == 410) {
         if (f->status == 410 && strcmp(h->pl, h->master))
@@ -2863,7 +2617,7 @@ static void seg_done(fetch_t *f, int ok, const char *err)
     }
     if (f->status == 200 && s->got >= TS) {
         if (s->q->dur > 0.2) {
-            double m = s->got / s->q->dur;
+            double m = (double)s->got / s->q->dur;
             h->avg_bps = h->avg_bps > 0 ? 0.7 * h->avg_bps + 0.3 * m : m;
         }
         h->consec_err = 0;
@@ -2871,10 +2625,10 @@ static void seg_done(fetch_t *f, int ok, const char *err)
     }
     s->failed = 1;
     ch->input_errors++;
-    snprintf(ch->last_error, sizeof ch->last_error, "segment: %s",
-             f->status && f->status != 200 ? "HTTP error" : (err ? err : "empty"));
     if (f->status && f->status != 200)
         snprintf(ch->last_error, sizeof ch->last_error, "segment HTTP %d", f->status);
+    else
+        snprintf(ch->last_error, sizeof ch->last_error, "segment: %s", err ? err : "empty");
     (void)ok;
     if (++h->consec_err >= 10)
         ch_input_fail(ch, ch->last_error);
@@ -3047,7 +2801,13 @@ static int attr_get(const char *line, const char *name, char *out, size_t outsz)
     return 0;
 }
 
-typedef struct { char *uri, *key; double dur; long long seq; uint8_t iv[16]; int ivset; } ent_t;
+typedef struct {
+    char *uri, *key;
+    double dur;
+    long long seq;
+    uint8_t iv[16];
+    int ivset;
+} ent_t;
 
 static void hls_parse(hls_t *h, char *text, const char *base)
 {
@@ -3094,11 +2854,13 @@ static void hls_parse(hls_t *h, char *text, const char *base)
         return;
     }
     ent_t ring[16];
+    memset(ring, 0, sizeof ring);
     long long cnt = 0, mseq = 0;
     int have_mseq = 0;
     double td = 0, dur = -1;
     char keyu[4096] = "";
     uint8_t iv[16];
+    memset(iv, 0, sizeof iv);
     int ivset = 0;
     for (char *line = strtok(text, "\r\n"); line; line = strtok(NULL, "\r\n")) {
         while (*line == ' ' || *line == '\t')
@@ -3122,7 +2884,7 @@ static void hls_parse(hls_t *h, char *text, const char *base)
                     if (attr_get(line, "IV", ivs, sizeof ivs) && (ivs[1] == 'x' || ivs[1] == 'X') &&
                         strlen(ivs) >= 34) {
                         for (int i = 0; i < 16; i++) {
-                            unsigned v;
+                            unsigned v = 0;
                             sscanf(ivs + 2 + 2 * i, "%2x", &v);
                             iv[i] = (uint8_t)v;
                         }
@@ -3237,7 +2999,7 @@ static void hls_pace(hls_t *h)
     dt = clampd(dt, 0, 0.5);
     double bps = hls_rate(h);
     size_t total = hls_total(h);
-    double buf_sec = total / bps;
+    double buf_sec = (double)total / bps;
     double hi = fmax(5.5, h->td + 1.0), mid = fmax(3.0, h->td * 0.65);
     double factor = buf_sec > hi ? 1.06 : buf_sec > mid ? 1.025 : 1.005;
     if (!h->burst_done) {
@@ -3283,7 +3045,7 @@ static void hls_pace(hls_t *h)
         ts_feed(ch, c->d + c->off, nfeed, 1);
         c->off += nfeed;
         s->unconsumed -= nfeed;
-        h->credit -= nfeed;
+        h->credit -= (double)nfeed;
         if (c->off >= c->len) {
             s->ch_head = c->next;
             if (!s->ch_head)
@@ -3318,12 +3080,167 @@ static void hls_tick(hls_t *h)
     hls_pace(h);
 }
 
+/* --------------------------------------------------------------- UDP/RTP */
+
+static int parse_udp_spec(const char *url, int *is_rtp, char *local_ip, size_t lsz,
+                          char *host_ip, size_t hsz, int *port)
+{
+    const char *p = url;
+    if (!strncasecmp(p, "udp://", 6)) {
+        *is_rtp = 0;
+        p += 6;
+    } else if (!strncasecmp(p, "rtp://", 6)) {
+        *is_rtp = 1;
+        p += 6;
+    } else
+        return -1;
+    local_ip[0] = 0;
+    const char *end = p + strcspn(p, "/?#");
+    const char *at = memchr(p, '@', (size_t)(end - p));
+    if (at) {
+        size_t ll = (size_t)(at - p);
+        if (ll >= lsz)
+            ll = lsz - 1;
+        memcpy(local_ip, p, ll);
+        local_ip[ll] = 0;
+        p = at + 1;
+    }
+    const char *colon = memchr(p, ':', (size_t)(end - p));
+    if (!colon)
+        return -1;
+    size_t hl = (size_t)(colon - p);
+    if (hl == 0 || hl >= hsz)
+        return -1;
+    memcpy(host_ip, p, hl);
+    host_ip[hl] = 0;
+    *port = atoi(colon + 1);
+    return (*port > 0 && *port <= 65535) ? 0 : -1;
+}
+
+static void udp_in_free(void *p)
+{
+    free(p);
+}
+
+static void udp_in_stop(channel_t *ch)
+{
+    if (!ch->udpin)
+        return;
+    udp_in_t *u = ch->udpin;
+    ch->udpin = NULL;
+    u->ev.dead = 1;
+    ev_close(&u->ev);
+    bury(udp_in_free, u);
+}
+
+static void udp_in_on_event(udp_in_t *u)
+{
+    channel_t *ch = u->ch;
+    if (!ch || u->ev.dead)
+        return;
+    static uint8_t pkt[65536];
+    for (int i = 0; i < 64; i++) {
+        ssize_t n = recv(u->ev.fd, pkt, sizeof pkt, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return;
+            return;
+        }
+        if (n == 0)
+            continue;
+        const uint8_t *d = pkt;
+        size_t dl = (size_t)n;
+        if (u->is_rtp && dl >= 12) {
+            int cc = d[0] & 0x0F;
+            int has_ext = (d[0] >> 4) & 1;
+            int has_pad = (d[0] >> 5) & 1;
+            size_t off = 12 + (size_t)cc * 4;
+            if (has_ext && off + 4 <= dl) {
+                uint16_t ext_words = (uint16_t)((d[off + 2] << 8) | d[off + 3]);
+                off += 4 + (size_t)ext_words * 4;
+            }
+            if (has_pad && dl > off) {
+                uint8_t pad = d[dl - 1];
+                if (pad <= dl - off)
+                    dl -= pad;
+            }
+            if (off < dl) {
+                d += off;
+                dl -= off;
+            } else {
+                continue;
+            }
+        }
+        ts_feed(ch, d, dl, 0);
+    }
+}
+
+static int udp_in_start(channel_t *ch, const char *url)
+{
+    int is_rtp = 0, port = 0;
+    char lip[64], gip[64];
+    if (parse_udp_spec(url, &is_rtp, lip, sizeof lip, gip, sizeof gip, &port) < 0)
+        return -1;
+    struct in_addr ga, la;
+    if (inet_pton(AF_INET, gip, &ga) != 1)
+        return -1;
+    la.s_addr = htonl(INADDR_ANY);
+    if (lip[0] && inet_pton(AF_INET, lip, &la) != 1)
+        la.s_addr = htonl(INADDR_ANY);
+
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    int rbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    uint32_t hip = ntohl(ga.s_addr);
+    int is_mcast = (hip >= 0xE0000000u && hip <= 0xEFFFFFFFu);
+    sa.sin_addr = is_mcast ? ga : (lip[0] ? la : ga);
+    if (!is_mcast && !lip[0])
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (is_mcast) {
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr = ga;
+        mreq.imr_interface = la;
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    udp_in_t *u = calloc(1, sizeof *u);
+    if (!u) {
+        close(fd);
+        return -1;
+    }
+    u->ev.type = EV_UDP_IN;
+    u->ev.fd = fd;
+    u->ev.obj = u;
+    u->ch = ch;
+    u->is_rtp = is_rtp;
+    ch->udpin = u;
+    ch->mode = IN_UDP;
+    ev_watch(&u->ev, EPOLLIN);
+    return 0;
+}
+
 /* ---------------------------------------------------------------- inputs */
 
 static void ch_input_stop(channel_t *ch)
 {
     fetch_cancel(ch->tsf);
     ch->tsf = NULL;
+    udp_in_stop(ch);
     if (ch->hls) {
         hls_t *h = ch->hls;
         ch->hls = NULL;
@@ -3337,7 +3254,7 @@ static void ch_input_fail(channel_t *ch, const char *msg)
 {
     if (msg && msg != ch->last_error)
         snprintf(ch->last_error, sizeof ch->last_error, "%s", msg);
-    LOG("%s: input %d failed: %s", ch->id, ch->cur + 1, ch->last_error);
+    ELOG("%s: input %d failed: %s", ch->id, ch->cur + 1, ch->last_error);
     ch_input_stop(ch);
     ch->fails_row++;
     int next = (ch->cur + 1) % ch->nurls;
@@ -3417,6 +3334,8 @@ static const fetch_cb_t g_ts_cb = {ts_in_head, ts_in_data, ts_in_done};
 
 static void ch_input_start(channel_t *ch)
 {
+    if (!ch->nurls)
+        return;
     char url[4096];
     snprintf(url, sizeof url, "%s", ch->urls[ch->cur]);
     char *hash = strchr(url, '#');
@@ -3438,6 +3357,12 @@ static void ch_input_start(channel_t *ch)
     ch->ts_checked = 0;
     ch->probe_m3u = 0;
     ch->probe.len = 0;
+
+    if (!strncasecmp(url, "udp://", 6) || !strncasecmp(url, "rtp://", 6)) {
+        if (udp_in_start(ch, url) < 0)
+            ch_input_fail(ch, "UDP/RTP bind failed");
+        return;
+    }
     size_t pl = strcspn(url, "?");
     if ((pl >= 5 && !strncasecmp(url + pl - 5, ".m3u8", 5)) || (pl >= 4 && !strncasecmp(url + pl - 4, ".m3u", 4))) {
         hls_start(ch, url, url, NULL);
@@ -3457,13 +3382,20 @@ static void ch_free(void *p)
     channel_t *ch = p;
     for (int i = 0; i < ch->nurls; i++)
         free(ch->urls[i]);
+    for (int i = 0; i < ch->n_udp_outs; i++) {
+        if (ch->udp_outs[i].fd >= 0)
+            close(ch->udp_outs[i].fd);
+    }
     free(ch->ring);
+    buf_free(&ch->cseg);
     buf_free(&ch->probe);
     free(ch);
 }
 
-static void ch_del(channel_t *ch)
+void ch_del(channel_t *ch)
 {
+    if (!ch)
+        return;
     for (channel_t **pp = &g_channels; *pp; pp = &(*pp)->next)
         if (*pp == ch) {
             *pp = ch->next;
@@ -3481,7 +3413,7 @@ static void ch_del(channel_t *ch)
     bury(ch_free, ch);
 }
 
-static void ch_wake(channel_t *ch)
+void ch_wake(channel_t *ch)
 {
     ch->last_client_act = g_now;
     if (ch->mode != IN_IDLE)
@@ -3507,7 +3439,6 @@ static void ch_wake(channel_t *ch)
     ch->cur = 0;
     ch->last_error[0] = 0;
     ch->idle_reported = 0;
-    LOG("%s: waking up on demand", ch->id);
     ch_input_start(ch);
 }
 
@@ -3515,7 +3446,6 @@ static void ch_sleep(channel_t *ch)
 {
     if (ch->mode == IN_IDLE)
         return;
-    LOG("%s: going idle (no active viewers)", ch->id);
     ch_input_stop(ch);
     hls_out_off(ch);
     free(ch->ring);
@@ -3533,30 +3463,58 @@ static void ch_sleep(channel_t *ch)
     snprintf(ch->last_error, sizeof ch->last_error, "idle");
 }
 
-static void ch_add(char **f, int nf)
+channel_t *ch_upsert(const char *id, double seg_dur, int seg_keep, const char *name,
+                     char **urls, int nurls, int keep_active, double idle_delay,
+                     char **udp_outs, int n_udp_outs)
 {
-    /* ADD id seg_dur seg_keep name url... */
-    if (nf < 6)
-        return;
-    channel_t *old = ch_find(f[1]);
+    channel_t *old = ch_find(id);
     if (old)
         ch_del(old);
+    if (!urls || nurls <= 0)
+        return NULL;
     channel_t *ch = calloc(1, sizeof *ch);
     if (!ch)
-        return;
-    snprintf(ch->id, sizeof ch->id, "%s", f[1]);
-    ch->seg_target = clampd(atof(f[2]), 1.0, 10.0);
-    ch->seg_keep = (int)clampd(atoi(f[3]), 2, 12);
-    snprintf(ch->name, sizeof ch->name, "%s", f[4]);
-    for (int i = 5; i < nf && ch->nurls < MAX_URLS; i++)
-        if (*f[i])
-            ch->urls[ch->nurls++] = strdup(f[i]);
+        return NULL;
+    snprintf(ch->id, sizeof ch->id, "%s", id);
+    ch->seg_target = clampd(seg_dur, 1.0, 10.0);
+    ch->seg_keep = (int)clampd(seg_keep, 2, 12);
+    snprintf(ch->name, sizeof ch->name, "%s", name ? name : "");
+    for (int i = 0; i < nurls && ch->nurls < MAX_URLS; i++)
+        if (urls[i] && urls[i][0])
+            ch->urls[ch->nurls++] = strdup(urls[i]);
     if (!ch->nurls) {
         free(ch);
-        return;
+        return NULL;
     }
-    ch->keep_active = 0;
-    ch->idle_delay = 20.0;
+    for (int i = 0; i < n_udp_outs && ch->n_udp_outs < MAX_UDP_OUT; i++) {
+        int is_rtp = 0, port = 0;
+        char lip[64], gip[64];
+        if (!udp_outs[i] || parse_udp_spec(udp_outs[i], &is_rtp, lip, sizeof lip, gip, sizeof gip, &port) < 0)
+            continue;
+        struct in_addr ga;
+        if (inet_pton(AF_INET, gip, &ga) != 1)
+            continue;
+        int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            continue;
+        unsigned char ttl = 32;
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+        if (lip[0]) {
+            struct in_addr la;
+            if (inet_pton(AF_INET, lip, &la) == 1)
+                setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &la, sizeof la);
+        }
+        udp_out_t *uo = &ch->udp_outs[ch->n_udp_outs++];
+        uo->fd = fd;
+        memset(&uo->addr, 0, sizeof uo->addr);
+        uo->addr.sin_family = AF_INET;
+        uo->addr.sin_port = htons((uint16_t)port);
+        uo->addr.sin_addr = ga;
+        uo->n = 0;
+    }
+
+    ch->keep_active = keep_active || (ch->n_udp_outs > 0);
+    ch->idle_delay = idle_delay >= 5.0 && idle_delay <= 3600.0 ? idle_delay : 20.0;
     for (int i = 0; i < ch->nurls; i++) {
         char *h = strchr(ch->urls[i], '#');
         if (!h)
@@ -3577,11 +3535,11 @@ static void ch_add(char **f, int nf)
     ch->hls_last_req = -1e9;
     ch->last_client_act = -1e9;
     if (ch->keep_active) {
-        ch->rcap = TS * 22310; /* ~4 MB until the bitrate is known */
+        ch->rcap = TS * 22310;
         ch->ring = malloc(ch->rcap);
         if (!ch->ring) {
             ch_free(ch);
-            return;
+            return NULL;
         }
         ch->hls_on = 1;
         ch->next = g_channels;
@@ -3594,6 +3552,7 @@ static void ch_add(char **f, int nf)
         ch->next = g_channels;
         g_channels = ch;
     }
+    return ch;
 }
 
 static void ch_tick(channel_t *ch, int second)
@@ -3601,9 +3560,7 @@ static void ch_tick(channel_t *ch, int second)
     if (ch->mode == IN_IDLE) {
         if (second && !ch->idle_reported) {
             ch->idle_reported = 1;
-            ctl_send("STAT\t%s\t0\t0\t%llu\t%llu\t0\t%d\t%llu\t-1\t0\t\t\t%llu\tidle\n",
-                     ch->id, (unsigned long long)ch->cc_err, (unsigned long long)ch->pes_err,
-                     ch->cur + 1, (unsigned long long)ch->packets, ch->input_errors);
+            ctl_on_ch_idle(ch);
         }
         return;
     }
@@ -3615,9 +3572,7 @@ static void ch_tick(channel_t *ch, int second)
             ch_sleep(ch);
             if (second && !ch->idle_reported) {
                 ch->idle_reported = 1;
-                ctl_send("STAT\t%s\t0\t0\t%llu\t%llu\t0\t%d\t%llu\t-1\t0\t\t\t%llu\tidle\n",
-                         ch->id, (unsigned long long)ch->cc_err, (unsigned long long)ch->pes_err,
-                         ch->cur + 1, (unsigned long long)ch->packets, ch->input_errors);
+                ctl_on_ch_idle(ch);
             }
             return;
         }
@@ -3661,7 +3616,7 @@ static void ch_tick(channel_t *ch, int second)
     if (second) {
         double el = g_now - ch->win_start;
         if (el > 0.2)
-            ch->bitrate = ch->win_bytes * 8.0 / el;
+            ch->bitrate = (double)ch->win_bytes * 8.0 / el;
         ch->win_bytes = 0;
         ch->win_start = g_now;
         ch->scrambled = ch->scr_win;
@@ -3669,160 +3624,15 @@ static void ch_tick(channel_t *ch, int second)
         if (g_now >= ch->next_resize) {
             ch->next_resize = g_now + 5;
             double bps = fmax(ch->bitrate, ch->pcr_bitrate) / 8;
-            /* Whole GOP + start burst + slack: with 10 s GOPs an 8 s ring held no keyframe old enough. */
             double secs = fmax(8.0, ch->gop + START_BURST_S + 1.5);
             size_t want = (size_t)clampd(bps * secs, 2.0 * 1024 * 1024, 32.0 * 1024 * 1024);
             if (want > ch->rcap * 1.25 || want < ch->rcap * 0.6)
                 ring_resize(ch, want);
         }
-        char pids[1024];
-        size_t pl = 0;
-        pids[0] = 0;
-        for (int pid = 0; pid < 8191 && pl < sizeof pids - 32; pid++)
-            if (ch->kind[pid] && ch->kind[pid] != K_PMT)
-                pl += snprintf(pids + pl, sizeof pids - pl, "%s%d:%d:%d", pl ? "," : "", pid, ch->kind[pid],
-                               ch->stype[pid]);
-        char pmts[256];
-        size_t ml = 0;
-        pmts[0] = 0;
-        for (int i = 0; i < ch->npmt; i++)
-            ml += snprintf(pmts + ml, sizeof pmts - ml, "%s%d:%d", ml ? "," : "", ch->pmt_pid[i], ch->pnr[i]);
-        char err[256];
-        snprintf(err, sizeof err, "%s", ch->last_error);
-        clean_field(err);
-        ctl_send("STAT\t%s\t%d\t%.0f\t%llu\t%llu\t%d\t%d\t%llu\t%d\t%d\t%s\t%s\t%llu\t%s\n", ch->id,
-                 ch->bitrate > 0 ? 1 : 0, ch->bitrate, (unsigned long long)ch->cc_err,
-                 (unsigned long long)ch->pes_err, ch->scrambled, ch->cur + 1, (unsigned long long)ch->packets,
-                 ch->pcr_pid, ch->tsid, pids, pmts, ch->input_errors, err);
     }
 }
 
-/* ----------------------------------------------------------------- control */
-
-static void ctl_flush(void)
-{
-    ctl_t *c = g_ctl;
-    if (!c || c->ev.dead)
-        return;
-    while (c->out.len) {
-        ssize_t n = send(c->ev.fd, c->out.p, c->out.len, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ev_watch(&c->ev, EPOLLIN | EPOLLOUT);
-                return;
-            }
-            return;
-        }
-        buf_drop(&c->out, n);
-    }
-    ev_watch(&c->ev, EPOLLIN);
-}
-
-static void ctl_free(void *p)
-{
-    ctl_t *c = p;
-    buf_free(&c->in);
-    buf_free(&c->out);
-    free(c);
-}
-
-static void ctl_close(ctl_t *c)
-{
-    if (c->ev.dead)
-        return;
-    c->ev.dead = 1;
-    ev_close(&c->ev);
-    if (g_ctl == c)
-        g_ctl = NULL;
-    bury(ctl_free, c);
-}
-
-static void ctl_line(ctl_t *c, char *line)
-{
-    char *f[MAX_URLS + 8];
-    int nf;
-    split_tabs(line, f, MAX_URLS + 8, &nf);
-    if (!c->authed) {
-        if (nf >= 2 && !strcmp(f[0], "AUTH") && !strcmp(f[1], g_secret)) {
-            c->authed = 1;
-            buf_str(&c->out, "OK\n");
-            ctl_flush();
-        } else {
-            ctl_close(c);
-        }
-        return;
-    }
-    if (!strcmp(f[0], "ADD"))
-        ch_add(f, nf);
-    else if (!strcmp(f[0], "WAKE") && nf >= 2) {
-        channel_t *ch = ch_find(f[1]);
-        if (ch)
-            ch_wake(ch);
-    } else if (!strcmp(f[0], "DEL") && nf >= 2) {
-        channel_t *ch = ch_find(f[1]);
-        if (ch)
-            ch_del(ch);
-    } else if (!strcmp(f[0], "KILL") && nf >= 2) {
-        unsigned long long id = strtoull(f[1], NULL, 10);
-        for (channel_t *ch = g_channels; ch; ch = ch->next)
-            for (front_t *x = ch->clients; x; x = x->cnext)
-                if (x->sess == id) {
-                    front_close(x);
-                    return;
-                }
-    } else if (!strcmp(f[0], "LISTEN") && nf >= 3) {
-        listener_add(f[1], atoi(f[2]));
-    } else if (!strcmp(f[0], "UNLISTEN") && nf >= 2) {
-        listener_del(atoi(f[1]));
-    }
-}
-
-static void ctl_on_event(ctl_t *c, uint32_t evs)
-{
-    if (evs & EPOLLOUT)
-        ctl_flush();
-    if (!(evs & (EPOLLIN | EPOLLHUP | EPOLLERR)))
-        return;
-    uint8_t rb[65536];
-    ssize_t n = recv(c->ev.fd, rb, sizeof rb, 0);
-    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        ctl_close(c);
-        return;
-    }
-    if (n < 0)
-        return;
-    buf_add(&c->in, rb, n);
-    size_t start = 0;
-    for (size_t i = 0; i < c->in.len && !c->ev.dead; i++)
-        if (c->in.p[i] == '\n') {
-            c->in.p[i] = 0;
-            if (i > start && c->in.p[i - 1] == '\r')
-                c->in.p[i - 1] = 0;
-            ctl_line(c, (char *)c->in.p + start);
-            start = i + 1;
-        }
-    if (!c->ev.dead)
-        buf_drop(&c->in, start);
-}
-
-static void ctl_accept(void)
-{
-    int fd = accept4(g_ctl_lev.fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (fd < 0)
-        return;
-    if (g_ctl)
-        ctl_close(g_ctl);
-    ctl_t *c = calloc(1, sizeof *c);
-    c->ev.type = EV_CTL;
-    c->ev.fd = fd;
-    c->ev.obj = c;
-    g_ctl = c;
-    for (channel_t *ch = g_channels; ch; ch = ch->next)
-        ch->idle_reported = 0;
-    ev_watch(&c->ev, EPOLLIN);
-}
-
-/* ------------------------------------------------------------------- main */
+/* ------------------------------------------------------------- lifecycle */
 
 static void front_sweep(void)
 {
@@ -3830,72 +3640,73 @@ static void front_sweep(void)
         nx = fr->gnext;
         if (fr->ev.dead)
             continue;
-        if ((fr->mode == FR_HEAD || fr->mode == FR_RESP) && g_now > fr->deadline)
+        if ((fr->mode == FR_HEAD || fr->mode == FR_BODY || fr->mode == FR_RESP || fr->mode == FR_WS) &&
+            g_now > fr->deadline) {
             front_close(fr);
+        }
     }
 }
 
-static volatile sig_atomic_t g_stop;
 static void on_term(int s)
 {
     (void)s;
     g_stop = 1;
 }
 
-int main(int argc, char **argv)
+static void on_hup(int s)
 {
-    const char *ctl_name = NULL;
-    const char *listens[16];
-    int nl = 0;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--ctl") && i + 1 < argc)
-            ctl_name = argv[++i];
-        else if (!strcmp(argv[i], "--secret") && i + 1 < argc)
-            snprintf(g_secret, sizeof g_secret, "%s", argv[++i]);
-        else if (!strcmp(argv[i], "--upstream") && i + 1 < argc)
-            g_upstream_port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--hls-parallel") && i + 1 < argc)
-            g_hls_parallel = atoi(argv[++i]) == 2 ? 2 : 1;
-        else if (!strcmp(argv[i], "--listen") && i + 1 < argc && nl < 16)
-            listens[nl++] = argv[++i];
-        else if (!strcmp(argv[i], "--version")) {
-            puts("astrag-core 1.3");
-            return 0;
-        }
-    }
-    if (!ctl_name || !g_secret[0] || !g_upstream_port || !nl) {
-        fprintf(stderr, "usage: astrag-core --ctl NAME --secret S --upstream PORT --listen HOST:PORT...\n");
-        return 2;
-    }
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-    prctl(PR_SET_NAME, "astrag-core");
+    (void)s;
+    g_hup = 1;
+}
+
+int engine_init(const char *proc_title, int argc, char **argv)
+{
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_term);
     signal(SIGINT, on_term);
-    /* A fixed mmap threshold stops glibc from moving big stream buffers into the brk heap,
-     * where freed holes fragment and are never returned (RSS grew to the high-water mark). */
+    signal(SIGHUP, on_hup);
+
+#ifdef __GLIBC__
     mallopt(M_MMAP_THRESHOLD, 128 * 1024);
     mallopt(M_TRIM_THRESHOLD, 1024 * 1024);
     mallopt(M_ARENA_MAX, 2);
+#endif
+
+    prctl(PR_SET_NAME, proc_title ? proc_title : "astrag", 0, 0, 0);
+    if (argc > 0 && argv && argv[0] && proc_title) {
+        char *end = argv[argc - 1] + strlen(argv[argc - 1]);
+        size_t span = (size_t)(end - argv[0]);
+        if (span >= strlen(proc_title)) {
+            memset(argv[0], 0, span);
+            memcpy(argv[0], proc_title, strlen(proc_title));
+        }
+    }
+
     crc_init();
     g_now = now_s();
     g_ssl = SSL_CTX_new(TLS_client_method());
     if (!g_ssl)
-        return 3;
+        return -1;
     SSL_CTX_set_verify(g_ssl, SSL_VERIFY_NONE, NULL);
 #ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
     SSL_CTX_set_options(g_ssl, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
     SSL_CTX_set_session_cache_mode(g_ssl, SSL_SESS_CACHE_OFF);
+
     g_ep = epoll_create1(EPOLL_CLOEXEC);
+    if (g_ep < 0)
+        return -1;
+
     if (pipe2(g_dpipe, O_CLOEXEC | O_NONBLOCK))
-        return 3;
+        return -1;
     set_nonblock(g_dpipe[0]);
     int fl = fcntl(g_dpipe[1], F_GETFL);
     fcntl(g_dpipe[1], F_SETFL, fl & ~O_NONBLOCK);
+    memset(&g_dev, 0, sizeof g_dev);
     g_dev.type = EV_DNS;
     g_dev.fd = g_dpipe[0];
     ev_watch(&g_dev, EPOLLIN);
+
     for (int i = 0; i < 3; i++) {
         pthread_t t;
         pthread_attr_t a;
@@ -3904,43 +3715,20 @@ int main(int argc, char **argv)
         pthread_create(&t, &a, dns_thread, NULL);
         pthread_detach(t);
     }
-    for (int i = 0; i < nl; i++) {
-        char hp[128];
-        snprintf(hp, sizeof hp, "%s", listens[i]);
-        char *c = strrchr(hp, ':');
-        if (!c)
-            return 2;
-        *c = 0;
-        if (listener_add(hp, atoi(c + 1)))
-            return 4;
-    }
-    int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    struct sockaddr_un su;
-    memset(&su, 0, sizeof su);
-    su.sun_family = AF_UNIX;
-    size_t cl = strlen(ctl_name);
-    if (cl > sizeof su.sun_path - 2)
-        return 2;
-    memcpy(su.sun_path + 1, ctl_name, cl);
-    if (bind(cfd, (struct sockaddr *)&su, offsetof(struct sockaddr_un, sun_path) + 1 + cl) || listen(cfd, 4)) {
-        LOG("control socket: %s", strerror(errno));
-        return 5;
-    }
-    g_ctl_lev.type = EV_CTL_LISTEN;
-    g_ctl_lev.fd = cfd;
-    ev_watch(&g_ctl_lev, EPOLLIN);
-    prctl(PR_SET_NAME, "astrag", 0, 0, 0);
-    if (argc > 0 && argv[0]) {
-        char *end = argv[argc - 1] + strlen(argv[argc - 1]);
-        if (end > argv[0]) memset(argv[0], 0, (size_t)(end - argv[0]));
-        memcpy(argv[0], "astrag", 6);
-    }
-    LOG("started, upstream 127.0.0.1:%d", g_upstream_port);
+    return 0;
+}
+
+void engine_loop(void)
+{
     double next_sec = g_now + 1.0, next_trim = g_now + 10.0;
     struct epoll_event evs[256];
     while (!g_stop) {
         int n = epoll_wait(g_ep, evs, 256, 20);
         g_now = now_s();
+        if (g_hup) {
+            g_hup = 0;
+            ctl_on_sighup();
+        }
         for (int i = 0; i < n; i++) {
             ev_t *e = evs[i].data.ptr;
             if (!e || e->dead)
@@ -3953,20 +3741,14 @@ int main(int argc, char **argv)
             case EV_FRONT:
                 front_on_event(e->obj, m);
                 break;
-            case EV_UP:
-                up_on_event(e->obj, m);
-                break;
             case EV_FETCH:
                 fetch_on_event(e->obj, m);
                 break;
-            case EV_CTL_LISTEN:
-                ctl_accept();
-                break;
-            case EV_CTL:
-                ctl_on_event(e->obj, m);
-                break;
             case EV_DNS:
                 dns_on_ready();
+                break;
+            case EV_UDP_IN:
+                udp_in_on_event(e->obj);
                 break;
             }
         }
@@ -3979,14 +3761,40 @@ int main(int argc, char **argv)
             nx = ch->next;
             ch_tick(ch, second);
         }
-        if (second)
+        if (second) {
+            ctl_on_tick_1s();
             front_sweep();
+        }
         if (second && g_now >= next_trim) {
             next_trim = g_now + 10.0;
+#ifdef __GLIBC__
             malloc_trim(0);
+#endif
         }
         reap();
     }
-    LOG("stopping");
-    return 0;
+}
+
+void engine_cleanup(void)
+{
+    while (g_channels)
+        ch_del(g_channels);
+    while (g_fronts)
+        front_close(g_fronts);
+    while (g_listeners)
+        listener_del(g_listeners->port);
+    reap();
+    buf_free(&g_scr);
+    if (g_ssl) {
+        SSL_CTX_free(g_ssl);
+        g_ssl = NULL;
+    }
+    if (g_ep >= 0) {
+        close(g_ep);
+        g_ep = -1;
+    }
+    if (g_dpipe[0] >= 0)
+        close(g_dpipe[0]);
+    if (g_dpipe[1] >= 0)
+        close(g_dpipe[1]);
 }
